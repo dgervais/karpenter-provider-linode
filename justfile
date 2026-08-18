@@ -12,9 +12,9 @@ CLUSTER_ID := env("CLUSTER_ID", "")
 CLUSTER_TIER := env("CLUSTER_TIER", "standard")
 CLUSTER_ACL_FLAGS := env("CLUSTER_ACL_FLAGS", '--acl.enabled true --acl.addresses.ipv4=$(curl --fail --silent --show-error https://ipv4.icanhazip.com)')
 K8S_VERSION := env("K8S_VERSION", if CLUSTER_TIER == "standard" {
-    "1.34"
+    "1.36"
 } else {
-    "v1.31.9+lke7"
+    "v1.34.6+lke2"
 })
 
 ## Inject the app version into operator.Version
@@ -22,6 +22,8 @@ WITH_GOFLAGS := "GOFLAGS=\"-ldflags=-X=sigs.k8s.io/karpenter/pkg/operator.Versio
 
 KO_DOCKER_REPO := env("KO_DOCKER_REPO", "docker.io/linode/karpenter-provider-linode")
 KOCACHE := env("KOCACHE", "~/.ko")
+## Image tags to publish; defaults to the current branch name when unset
+IMAGE_TAGS := env("IMAGE_TAGS", "")
 CLOUD_FIREWALL_CRD_CHART_VERSION := "0.2.0"
 CLOUD_FIREWALL_CONTROLLER_CHART_VERSION := "0.2.1"
 
@@ -124,8 +126,16 @@ destroy-lke-cluster cluster_id:
 	linode-cli lke cluster-delete '{{ cluster_id }}'
 	rm -f {{ KUBECONFIG }}
 
+# Build and push the controller image with ko
 build-karpl-image:
-	{{ WITH_GOFLAGS }} KOCACHE={{ KOCACHE }} KO_DOCKER_REPO={{ KO_DOCKER_REPO }} ko build -t $(git rev-parse --abbrev-ref HEAD) --bare github.com/linode/karpenter-provider-linode/cmd/controller
+	#!/usr/bin/env bash
+	set -euo pipefail
+	tags="{{ IMAGE_TAGS }}"
+	if [ -z "$tags" ]; then
+		tags=$(git rev-parse --abbrev-ref HEAD)
+	fi
+	{{ WITH_GOFLAGS }} KOCACHE={{ KOCACHE }} KO_DOCKER_REPO={{ KO_DOCKER_REPO }} \
+		ko build --bare --tags "$tags" github.com/linode/karpenter-provider-linode/cmd/controller
 
 # Run tilt against the LKE cluster in kubeconfig
 run-tilt-lke: build-karpl-image
@@ -240,4 +250,4 @@ run-e2e:
 	chainsaw test e2e --selector {{ CHAINSAW_SELECTOR }} {{ CHAINSAW_FLAGS }}
 
 # Set up and run e2e tests
-setup-and-test-e2e: create-lke-cluster configure-lke-cluster pre-e2e-cleanup-and-sanity restart-karpenter-before-e2e run-e2e
+setup-and-test-e2e: build-karpl-image create-lke-cluster configure-lke-cluster pre-e2e-cleanup-and-sanity restart-karpenter-before-e2e run-e2e
