@@ -1,0 +1,81 @@
+name: e2e-pr-trigger
+
+on:
+  pull_request_target:
+
+permissions:
+  contents: read
+  pull-requests: read
+  actions: read
+  id-token: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      paths: ${{ steps.filter.outputs.changes }}
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@b09bb98e06d4d774595224525879c09bc6e98c40 # v2.20.1
+        with:
+          disable-sudo: true
+          egress-policy: block
+          allowed-endpoints: >
+            api.github.com:443
+            github.com:443
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
+        id: filter
+        with:
+          filters: .github/filters.yml
+
+  e2e-pr:
+    name: PR E2E (standard)
+    needs: changes
+    if: (contains(fromJSON(needs.changes.outputs.paths), 'src') || contains(fromJSON(needs.changes.outputs.paths), 'e2e_ci'))
+    uses: ./.github/workflows/e2e.yaml
+    with:
+      environment: ${{ (github.event_name == 'pull_request_target' && github.event.pull_request.head.repo.full_name != github.repository) && 'prod-external' || 'prod' }}
+      cluster_name: ${{ format('kpr-{0}', github.event.pull_request.number) }}
+      chainsaw_selector: pr
+      cleanup: false
+      timeout_minutes: 60
+      cleanup_timeout_minutes: 20
+      harden_runner_egress_policy: block
+      harden_runner_allowed_endpoints: >-
+        *.linodelke.net:443
+        api.github.com:443
+        api.linode.com:443
+        api.segment.io:443
+        auth.docker.io:443
+        identity.docker.com:443
+        files.pythonhosted.org:443
+        gcr.io:443
+        github.com:443
+        index.docker.io:443
+        ipv4.icanhazip.com:443
+        linode.github.io:443
+        pypi.org:443
+        registry-1.docker.io:443
+        release-assets.githubusercontent.com:443
+        *.githubusercontent.com:443
+        cdn.dl.k8s.io:443
+        dl.google.com:443
+        dl.k8s.io:443
+        get.helm.sh:443
+        mise-versions.jdx.dev:443
+        mise.jdx.dev:443
+        proxy.golang.org:443
+        storage.googleapis.com:443
+        sum.golang.org:443
+        tuf-repo-cdn.sigstore.dev:443
+    secrets: inherit

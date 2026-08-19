@@ -20,7 +20,7 @@ import (
 
 	"github.com/awslabs/operatorpkg/object"
 	"github.com/awslabs/operatorpkg/status"
-	"github.com/linode/linodego"
+	"github.com/linode/linodego/v2"
 	"github.com/samber/lo"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/client-go/tools/record"
@@ -57,6 +57,7 @@ var cluster *state.Cluster
 var cloudProvider *cloudprovider.CloudProvider
 
 func TestLinode(t *testing.T) {
+	t.Parallel()
 	ctx = TestContextWithLogger(t)
 	RegisterFailHandler(Fail)
 	RunSpecs(t, "InstanceTypeProvider")
@@ -85,6 +86,7 @@ var _ = BeforeEach(func() {
 	ctx = options.ToContext(ctx, test.Options())
 	cluster.Reset()
 	linodeEnv.Reset()
+	linodeEnv.SetDefaults()
 })
 
 var _ = AfterEach(func() {
@@ -107,11 +109,9 @@ var _ = Describe("InstanceTypeProvider", func() {
 					Spec: karpv1.NodeClaimTemplateSpec{
 						Requirements: []karpv1.NodeSelectorRequirementWithMinValues{
 							{
-								NodeSelectorRequirement: corev1.NodeSelectorRequirement{
-									Key:      corev1.LabelTopologyRegion,
-									Operator: corev1.NodeSelectorOpIn,
-									Values:   []string{fake.DefaultRegion},
-								},
+								Key:      corev1.LabelTopologyRegion,
+								Operator: corev1.NodeSelectorOpIn,
+								Values:   []string{fake.DefaultRegion},
 							},
 						},
 						NodeClassRef: &karpv1.NodeClassReference{
@@ -181,7 +181,7 @@ var _ = Describe("InstanceTypeProvider", func() {
 			It("should use defaults when no kubelet is specified", func() {
 				nodeClass.Spec.Kubelet = &v1.KubeletConfiguration{}
 				it := instancetype.NewInstanceType(ctx,
-					info,
+					&info,
 					fake.DefaultRegion,
 					nodeClass.Spec.Kubelet.MaxPods,
 					nodeClass.Spec.Kubelet.PodsPerCore,
@@ -203,7 +203,7 @@ var _ = Describe("InstanceTypeProvider", func() {
 					},
 				}
 				it := instancetype.NewInstanceType(ctx,
-					info,
+					&info,
 					fake.DefaultRegion,
 					nodeClass.Spec.Kubelet.MaxPods,
 					nodeClass.Spec.Kubelet.PodsPerCore,

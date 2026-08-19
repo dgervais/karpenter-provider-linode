@@ -51,6 +51,7 @@ var controller *nodeclass.Controller
 var cloudProvider *cloudprovider.CloudProvider
 
 func TestAPIs(t *testing.T) {
+	t.Parallel()
 	ctx = TestContextWithLogger(t)
 	RegisterFailHandler(Fail)
 	RunSpecs(t, "LinodeNodeClass")
@@ -83,8 +84,9 @@ var _ = BeforeEach(func() {
 	controller = nodeclass.NewController(
 		env.Client,
 		cloudProvider,
-		events.NewRecorder(&record.FakeRecorder{}),
+		linodeEnv.EventRecorder,
 		fake.DefaultRegion,
+		fake.DefaultClusterID,
 		linodeEnv.InstanceTypesProvider,
 		linodeEnv.LinodeAPI,
 		linodeEnv.ValidationCache,

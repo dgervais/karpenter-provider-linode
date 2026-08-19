@@ -62,6 +62,7 @@ var standardImage v1.LinodeImage
 var nvidiaImage v1.LinodeImage
 
 func TestLinode(t *testing.T) {
+	t.Parallel()
 	ctx = TestContextWithLogger(t)
 	RegisterFailHandler(Fail)
 	RunSpecs(t, "CapacityCache")
@@ -93,7 +94,7 @@ var _ = BeforeEach(func() {
 	linodeInstanceTypeInfo := fake.MakeInstances()
 	linodeOfferings := fake.MakeInstanceOfferings(linodeInstanceTypeInfo)
 	linodeEnv.LinodeAPI.ListTypesOutput.Set(&linodeInstanceTypeInfo)
-	linodeEnv.LinodeAPI.ListRegionsAvailabilityOutput.Set(&linodeOfferings)
+	linodeEnv.LinodeAPI.GetRegionAvailabilityOutput.Set(&linodeOfferings)
 	Expect(linodeEnv.InstanceTypesProvider.UpdateInstanceTypes(ctx)).To(Succeed())
 	Expect(linodeEnv.InstanceTypesProvider.UpdateInstanceTypeOfferings(ctx)).To(Succeed())
 	standardImage = v1.LinodeImage{

@@ -19,13 +19,12 @@ import (
 	"testing"
 	"time"
 
-	"k8s.io/apimachinery/pkg/api/errors"
-
 	"github.com/awslabs/operatorpkg/object"
 	opstatus "github.com/awslabs/operatorpkg/status"
-	"github.com/linode/linodego"
+	"github.com/linode/linodego/v2"
 	"github.com/samber/lo"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/tools/record"
@@ -44,6 +43,7 @@ import (
 	"github.com/linode/karpenter-provider-linode/pkg/apis"
 	v1 "github.com/linode/karpenter-provider-linode/pkg/apis/v1alpha1"
 	"github.com/linode/karpenter-provider-linode/pkg/cloudprovider"
+	nodeclasscontroller "github.com/linode/karpenter-provider-linode/pkg/controllers/nodeclass"
 	"github.com/linode/karpenter-provider-linode/pkg/fake"
 	"github.com/linode/karpenter-provider-linode/pkg/operator/options"
 	"github.com/linode/karpenter-provider-linode/pkg/test"
@@ -65,6 +65,7 @@ var fakeClock *clock.FakeClock
 var recorder events.Recorder
 
 func TestLinode(t *testing.T) {
+	t.Parallel()
 	ctx = TestContextWithLogger(t)
 	RegisterFailHandler(Fail)
 	RunSpecs(t, "cloudProvider/Linode")
@@ -94,6 +95,7 @@ var _ = BeforeEach(func() {
 	ctx = coreoptions.ToContext(ctx, coretest.Options(coretest.OptionsFields{FeatureGates: coretest.FeatureGates{ReservedCapacity: lo.ToPtr(true)}}))
 	ctx = options.ToContext(ctx, test.Options())
 	linodeEnv.Reset()
+	linodeEnv.SetDefaults()
 })
 
 var _ = AfterEach(func() {
@@ -197,11 +199,9 @@ var _ = Describe("CloudProvider", func() {
 		// Specify no instance types and expect to receive a capacity error
 		nodeClaim.Spec.Requirements = []karpv1.NodeSelectorRequirementWithMinValues{
 			{
-				NodeSelectorRequirement: corev1.NodeSelectorRequirement{
-					Key:      corev1.LabelInstanceTypeStable,
-					Operator: corev1.NodeSelectorOpIn,
-					Values:   []string{"test-instance-type"},
-				},
+				Key:      corev1.LabelInstanceTypeStable,
+				Operator: corev1.NodeSelectorOpIn,
+				Values:   []string{"test-instance-type"},
 			},
 		}
 		ExpectApplied(ctx, env.Client, nodePool, nodeClass, nodeClaim)
@@ -250,7 +250,7 @@ var _ = Describe("CloudProvider", func() {
 			linodeInstanceTypeInfo := fake.MakeInstances()
 			linodeEnv.LinodeAPI.ListTypesOutput.Set(&linodeInstanceTypeInfo)
 			linodeOfferings := fake.MakeInstanceOfferings(linodeInstanceTypeInfo)
-			linodeEnv.LinodeAPI.ListRegionsAvailabilityOutput.Set(&linodeOfferings)
+			linodeEnv.LinodeAPI.GetRegionAvailabilityOutput.Set(&linodeOfferings)
 			Expect(linodeEnv.InstanceTypesProvider.UpdateInstanceTypes(ctx)).To(Succeed())
 			Expect(linodeEnv.InstanceTypesProvider.UpdateInstanceTypeOfferings(ctx)).To(Succeed())
 			instanceNames := lo.Map(linodeInstanceTypeInfo, func(info linodego.LinodeType, _ int) string { return info.ID })
@@ -267,18 +267,14 @@ var _ = Describe("CloudProvider", func() {
 							},
 							Requirements: []karpv1.NodeSelectorRequirementWithMinValues{
 								{
-									NodeSelectorRequirement: corev1.NodeSelectorRequirement{
-										Key:      v1.LabelInstanceClass,
-										Operator: corev1.NodeSelectorOpIn,
-										Values:   []string{"standard"},
-									},
+									Key:      v1.LabelInstanceClass,
+									Operator: corev1.NodeSelectorOpIn,
+									Values:   []string{"standard"},
 								},
 								{
-									NodeSelectorRequirement: corev1.NodeSelectorRequirement{
-										Key:      corev1.LabelInstanceTypeStable,
-										Operator: corev1.NodeSelectorOpIn,
-										Values:   instanceNames,
-									},
+									Key:       corev1.LabelInstanceTypeStable,
+									Operator:  corev1.NodeSelectorOpIn,
+									Values:    instanceNames,
 									MinValues: lo.ToPtr(2),
 								},
 							},
@@ -406,6 +402,21 @@ var _ = Describe("CloudProvider", func() {
 				Expect(err).NotTo(HaveOccurred())
 				Expect(isDrifted).To(BeEmpty())
 			})
+			It("should not return drifted when only tags change", func() {
+				nodeClass.Annotations = map[string]string{
+					v1.AnnotationLinodeNodeClassHash:        nodeClass.Hash(),
+					v1.AnnotationLinodeNodeClassHashVersion: v1.LinodeNodeClassHashVersion,
+				}
+				nodeClaim.Annotations = map[string]string{
+					v1.AnnotationLinodeNodeClassHash:        nodeClass.Hash(),
+					v1.AnnotationLinodeNodeClassHashVersion: v1.LinodeNodeClassHashVersion,
+				}
+				nodeClass.Spec.Tags = []string{"updated=value"}
+				ExpectApplied(ctx, env.Client, nodePool, nodeClass)
+				isDrifted, err := cloudProvider.IsDrifted(ctx, nodeClaim)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(isDrifted).To(BeEmpty())
+			})
 			It("should not return drifted if the NodeClaim's karpenter.k8s.linode/LinodeNodeclass-hash-version annotation does not match the LinodeNodeClass's", func() {
 				nodeClass.Annotations = map[string]string{
 					v1.AnnotationLinodeNodeClassHash:        "test-hash-111111",
@@ -524,6 +535,32 @@ var _ = Describe("CloudProvider LKE Mode", func() {
 		It("should return NodeClassNotReady error when LKENodeClass is not ready", func() {
 			lkeNodeClass.StatusConditions().SetFalse(opstatus.ConditionReady, "NodeClassNotReady", "NodeClass not ready")
 			ExpectApplied(ctx, env.Client, lkeNodePool, lkeNodeClass, lkeNodeClaim)
+			_, err := cloudProvider.Create(ctx, lkeNodeClaim)
+			Expect(err).To(HaveOccurred())
+			Expect(corecloudprovider.IsNodeClassNotReadyError(err)).To(BeTrue())
+		})
+
+		It("should return NodeClassNotReady when lkeK8sVersion validation marks the NodeClass not ready", func() {
+			lkeNodeClass.Spec.LKEK8sVersion = lo.ToPtr("v1.32.8+lke13")
+			linodeEnv.LinodeAPI.ClusterTier = linodego.LKEVersionStandard
+
+			nodeClassController := nodeclasscontroller.NewController(
+				env.Client,
+				cloudProvider,
+				linodeEnv.EventRecorder,
+				fake.DefaultRegion,
+				fake.DefaultClusterID,
+				linodeEnv.InstanceTypesProvider,
+				linodeEnv.LinodeAPI,
+				linodeEnv.ValidationCache,
+				options.FromContext(ctx).DisableDryRun,
+			)
+			ExpectApplied(ctx, env.Client, lkeNodePool, lkeNodeClass, lkeNodeClaim)
+			ExpectObjectReconciled(ctx, env.Client, nodeClassController, lkeNodeClass)
+
+			lkeNodeClass = ExpectExists(ctx, env.Client, lkeNodeClass)
+			Expect(lkeNodeClass.StatusConditions().Get(opstatus.ConditionReady).IsFalse()).To(BeTrue())
+
 			_, err := cloudProvider.Create(ctx, lkeNodeClaim)
 			Expect(err).To(HaveOccurred())
 			Expect(corecloudprovider.IsNodeClassNotReadyError(err)).To(BeTrue())

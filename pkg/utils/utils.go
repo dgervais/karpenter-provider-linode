@@ -18,6 +18,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"net/http"
 	"os"
@@ -25,15 +26,13 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/samber/lo"
-
 	"github.com/awslabs/operatorpkg/serrors"
+	"github.com/linode/linodego/v2"
+	"github.com/samber/lo"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	karpv1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 	"sigs.k8s.io/karpenter/pkg/scheduling"
-
-	"github.com/linode/linodego"
 
 	"github.com/linode/karpenter-provider-linode/pkg/apis/v1alpha1"
 	linodecache "github.com/linode/karpenter-provider-linode/pkg/cache"
@@ -45,6 +44,17 @@ var (
 	ErrInstanceNotFound = errors.New("instance not found")
 	instanceIDRegex     = regexp.MustCompile(`(?P<Provider>.*)://(?P<InstanceID>.*)`)
 )
+
+const maxLinodeTagLength = 50
+
+var restrictedTagKeys = map[string]struct{}{
+	karpv1.NodePoolLabelKey:       {},
+	v1alpha1.LabelNodeClass:       {},
+	v1alpha1.LabelLKEManaged:      {},
+	v1alpha1.NodeClaimTagKey:      {},
+	v1alpha1.LKEClusterNameTagKey: {},
+	v1alpha1.NameTagKey:           {},
+}
 
 // ParseInstanceID parses the provider ID stored on the node to get the instance ID
 // associated with a node
@@ -119,17 +129,62 @@ func GetTagsForLKE(nodeClass *v1alpha1.LinodeNodeClass, nodeClaim *karpv1.NodeCl
 		v1alpha1.LabelLKEManaged:                             "true",
 	}
 
-	return lo.Assign(TagListToMap(nodeClass.Spec.Tags), staticTags)
+	return staticTags
 }
 
-func GetInstanceTagsForLKE(nodeClaimName string) map[string]string {
-	return map[string]string{
-		v1alpha1.NodeClaimTagKey: nodeClaimName,
+func NodeClaimTag(nodeClaimName string) string {
+	return fmt.Sprintf("%s=%s", v1alpha1.NodeClaimTagKey, NormalizeNodeClaimTagValue(nodeClaimName))
+}
+
+func NormalizeNodeClaimTagValue(nodeClaimName string) string {
+	maxValueLength := maxLinodeTagLength - len(v1alpha1.NodeClaimTagKey) - 1 // account for '='
+	if maxValueLength <= 0 {
+		return ""
 	}
+	if len(nodeClaimName) <= maxValueLength {
+		return nodeClaimName
+	}
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(nodeClaimName))
+	hash := fmt.Sprintf("%08x", h.Sum32())
+	prefixLength := maxValueLength - len(hash) - 1
+	if prefixLength <= 0 {
+		if len(hash) > maxValueLength {
+			return hash[:maxValueLength]
+		}
+		return hash
+	}
+	return fmt.Sprintf("%s-%s", nodeClaimName[:prefixLength], hash)
 }
 
 func GetNodeClassHash(nodeClass *v1alpha1.LinodeNodeClass) string {
 	return fmt.Sprintf("%s-%d", nodeClass.UID, nodeClass.Generation)
+}
+
+func ValidateTags(tags []string) error {
+	invalidTags := []string{}
+	seen := map[string]struct{}{}
+	for _, tag := range tags {
+		key, _, ok := splitTag(tag)
+		if !ok {
+			continue
+		}
+		if _, restricted := restrictedTagKeys[key]; !restricted {
+			continue
+		}
+		if _, exists := seen[tag]; exists {
+			continue
+		}
+		invalidTags = append(invalidTags, tag)
+		seen[tag] = struct{}{}
+	}
+	if len(invalidTags) == 0 {
+		return nil
+	}
+	quotedTags := lo.Map(invalidTags, func(tag string, _ int) string {
+		return fmt.Sprintf("%q", tag)
+	})
+	return serrors.Wrap(fmt.Errorf("tags failed validation requirements"), "tags", strings.Join(quotedTags, ", "))
 }
 
 func TagListToMap(tags []string) map[string]string {
@@ -168,7 +223,18 @@ func DedupeTags(tags []string) []string {
 	return uniqueTags
 }
 
-func splitTag(tag string) (string, string, bool) {
+func OpaqueTags(tags []string) []string {
+	opaqueTags := make([]string, 0, len(tags))
+	for _, tag := range tags {
+		if _, _, ok := splitTag(tag); ok {
+			continue
+		}
+		opaqueTags = append(opaqueTags, tag)
+	}
+	return opaqueTags
+}
+
+func splitTag(tag string) (key, value string, ok bool) {
 	index := strings.IndexRune(tag, '=')
 	if index <= 0 || index == len(tag)-1 {
 		return "", "", false

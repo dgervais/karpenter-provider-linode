@@ -1,0 +1,112 @@
+name: e2e-manual-trigger
+
+on:
+  workflow_dispatch:
+    inputs:
+      chainsaw_selector:
+        description: Chainsaw selector to run for manual dispatch
+        required: false
+        default: all
+      cluster_tier:
+        description: LKE cluster tier to run for manual dispatch
+        required: false
+        default: standard
+        type: choice
+        options:
+          - standard
+          - enterprise
+
+permissions:
+  contents: read
+  pull-requests: read
+  actions: read
+  id-token: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  e2e-manual-standard:
+    name: Manual E2E (standard)
+    if: ${{ inputs.cluster_tier == 'standard' }}
+    uses: ./.github/workflows/e2e.yaml
+    with:
+      cluster_name: ${{ format('km-{0}', github.run_id) }}
+      cluster_tier: standard
+      chainsaw_selector: ${{ inputs.chainsaw_selector }}
+      cleanup: true
+      timeout_minutes: 90
+      cleanup_timeout_minutes: 20
+      harden_runner_egress_policy: block
+      harden_runner_allowed_endpoints: >-
+        *.linodelke.net:443
+        api.github.com:443
+        api.linode.com:443
+        api.segment.io:443
+        auth.docker.io:443
+        identity.docker.com:443
+        files.pythonhosted.org:443
+        gcr.io:443
+        github.com:443
+        index.docker.io:443
+        ipv4.icanhazip.com:443
+        linode.github.io:443
+        pypi.org:443
+        registry-1.docker.io:443
+        release-assets.githubusercontent.com:443
+        *.githubusercontent.com:443
+        cdn.dl.k8s.io:443
+        dl.google.com:443
+        dl.k8s.io:443
+        get.helm.sh:443
+        mise-versions.jdx.dev:443
+        mise.jdx.dev:443
+        proxy.golang.org:443
+        storage.googleapis.com:443
+        sum.golang.org:443
+        tuf-repo-cdn.sigstore.dev:443
+    secrets: inherit
+
+  e2e-manual-enterprise:
+    name: Manual E2E (enterprise)
+    if: ${{ inputs.cluster_tier == 'enterprise' }}
+    uses: ./.github/workflows/e2e.yaml
+    with:
+      cluster_name: ${{ format('km-{0}', github.run_id) }}
+      cluster_tier: enterprise
+      chainsaw_selector: ${{ inputs.chainsaw_selector }}
+      cleanup: true
+      timeout_minutes: 90
+      cleanup_timeout_minutes: 20
+      harden_runner_egress_policy: block
+      harden_runner_allowed_endpoints: >-
+        *.linodelke.net:443
+        *.enterprise.linodelke.net:6443
+        api.github.com:443
+        api.linode.com:443
+        api.segment.io:443
+        auth.docker.io:443
+        identity.docker.com:443
+        files.pythonhosted.org:443
+        gcr.io:443
+        github.com:443
+        index.docker.io:443
+        ipv4.icanhazip.com:443
+        linode.github.io:443
+        pypi.org:443
+        registry-1.docker.io:443
+        release-assets.githubusercontent.com:443
+        *.githubusercontent.com:443
+        cdn.dl.k8s.io:443
+        cloud.tilt.dev:443
+        dl.k8s.io:443
+        dl.google.com:443
+        get.helm.sh:443
+        mise-versions.jdx.dev:443
+        mise.jdx.dev:443
+        proxy.golang.org:443
+        storage.googleapis.com:443
+        sum.golang.org:443
+        tuf-repo-cdn.sigstore.dev:443
+    secrets: inherit

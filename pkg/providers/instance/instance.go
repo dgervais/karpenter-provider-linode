@@ -20,12 +20,11 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/samber/lo"
-
 	"github.com/awslabs/operatorpkg/option"
 	"github.com/google/uuid"
-	"github.com/linode/linodego"
+	"github.com/linode/linodego/v2"
 	"github.com/patrickmn/go-cache"
+	"github.com/samber/lo"
 	karpv1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 	"sigs.k8s.io/karpenter/pkg/events"
@@ -48,6 +47,7 @@ type Provider interface {
 	List(context.Context) ([]*Instance, error)
 	Delete(context.Context, string) error
 	CreateTags(context.Context, string, map[string]string) error
+	UpdateTags(context.Context, string, []string) error
 }
 
 type options struct {
@@ -71,7 +71,6 @@ func NewDefaultProvider(
 	unavailableOfferings *linodecache.UnavailableOfferings,
 	instanceCache *cache.Cache,
 ) *DefaultProvider {
-
 	return &DefaultProvider{
 		region:               region,
 		recorder:             recorder,
@@ -140,7 +139,7 @@ func (p *DefaultProvider) Create(ctx context.Context, nodeClass *v1.LinodeNodeCl
 		return nil, cloudprovider.NewCreateError(err, "InstanceCreationFailed", fmt.Sprintf("Failed to create Linode instance: %s", err.Error()))
 	}
 
-	return NewInstance(ctx, *instance), nil
+	return NewInstance(ctx, instance), nil
 }
 
 func (p *DefaultProvider) Get(ctx context.Context, id string, opts ...Options) (*Instance, error) {
@@ -240,9 +239,24 @@ func (p *DefaultProvider) CreateTags(ctx context.Context, id string, tags map[st
 	return nil
 }
 
+func (p *DefaultProvider) UpdateTags(ctx context.Context, id string, tags []string) error {
+	intID, err := strconv.Atoi(id)
+	if err != nil {
+		return fmt.Errorf("invalid instance id %s, %w", id, err)
+	}
+	if _, err := p.client.UpdateInstance(ctx, intID, linodego.InstanceUpdateOptions{Tags: tags}); err != nil {
+		if linodego.IsNotFound(err) {
+			return cloudprovider.NewNodeClaimNotFoundError(fmt.Errorf("updating instance tags, %w", err))
+		}
+		return fmt.Errorf("updating instance tags, %w", err)
+	}
+	p.instanceCache.Delete(id)
+	return nil
+}
+
 func instancesFromLinodeInstances(ctx context.Context, instances []linodego.Instance) ([]*Instance, error) {
 	if len(instances) == 0 {
 		return nil, cloudprovider.NewNodeClaimNotFoundError(fmt.Errorf("instance not found"))
 	}
-	return lo.Map(instances, func(i linodego.Instance, _ int) *Instance { return NewInstance(ctx, i) }), nil
+	return lo.Map(instances, func(i linodego.Instance, _ int) *Instance { inst := i; return NewInstance(ctx, &inst) }), nil
 }

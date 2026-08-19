@@ -447,25 +447,13 @@ spec:
                     evictionSoft
                   rule: has(self.evictionSoftGracePeriod) ? self.evictionSoftGracePeriod.all(e,
                     (e in self.evictionSoft)):true
-              labels:
-                additionalProperties:
-                  type: string
-                description: labels is a map of Kubernetes node labels to apply to
-                  the Node.
-                type: object
               lkeK8sVersion:
                 description: |-
                   lkeK8sVersion is the Kubernetes version for LKE node pools.
                   Only used in LKE mode. Only available for Enterprise LKE clusters.
-                type: string
-              lkeUpdateStrategy:
-                description: |-
-                  lkeUpdateStrategy defines how nodes are updated when the LKE node pool is modified.
-                  Only used in LKE mode.
-                  Valid values are "rolling_update" and "on_recycle".
-                enum:
-                - rolling_update
-                - on_recycle
+                  The LKE cluster control plane version must already be upgraded to this version
+                  before setting this field. Otherwise pool reconciliation fails and replacement
+                  NodeClaims won't become ready on the requested worker version.
                 type: string
               osDisk:
                 description: |-

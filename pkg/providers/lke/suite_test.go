@@ -19,11 +19,12 @@ import (
 	"fmt"
 	"net/http"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/awslabs/operatorpkg/object"
-	"github.com/linode/linodego"
+	"github.com/linode/linodego/v2"
 	"github.com/samber/lo"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -57,7 +58,18 @@ var env *coretest.Environment
 var linodeEnv *test.Environment
 var recorder events.Recorder
 
+const (
+	retryMessage     = "retry"
+	standardNodeType = "g6-standard-2"
+	standard8GBType  = "g6-standard-4"
+	productionTag    = "env=production"
+	defaultNodeLabel = "node-0"
+	fooKey           = "foo"
+	barValue         = "bar"
+)
+
 func newEnterpriseProvider(env *test.Environment, recorder events.Recorder) *lke.DefaultProvider {
+	env.LinodeAPI.ClusterTier = linodego.LKEVersionEnterprise
 	return lke.NewDefaultProvider(
 		fake.DefaultClusterID,
 		linodego.LKEVersionEnterprise,
@@ -95,6 +107,7 @@ func enqueueListInstances(env *test.Environment, lists ...[]linodego.Instance) {
 }
 
 func TestNodepool(t *testing.T) {
+	t.Parallel()
 	ctx = TestContextWithLogger(t)
 	RegisterFailHandler(Fail)
 	RunSpecs(t, "NodePool Provider Suite")
@@ -120,6 +133,7 @@ var _ = BeforeEach(func() {
 	ctx = coreoptions.ToContext(ctx, coretest.Options(coretest.OptionsFields{}))
 	ctx = options.ToContext(ctx, test.Options())
 	linodeEnv.Reset()
+	linodeEnv.SetDefaults()
 })
 
 var _ = Describe("LKENodeProvider", func() {
@@ -165,7 +179,7 @@ var _ = Describe("LKENodeProvider", func() {
 		Context("Standard tier", func() {
 			Context("Create", func() {
 				It("should surface instance lookup errors", func() {
-					linodeEnv.LinodeAPI.ListInstancesBehavior.Error.Set(&linodego.Error{Code: http.StatusServiceUnavailable, Message: "retry"})
+					linodeEnv.LinodeAPI.ListInstancesBehavior.Error.Set(&linodego.Error{Code: http.StatusServiceUnavailable, Message: retryMessage})
 
 					ExpectApplied(ctx, env.Client, nodeClaim, nodePoolObj, nodeClass)
 					nodeClass = ExpectExists(ctx, env.Client, nodeClass)
@@ -175,14 +189,13 @@ var _ = Describe("LKENodeProvider", func() {
 					poolInstance, err := linodeEnv.LKENodeProvider.Create(ctx, nodeClass, nodeClaim, map[string]string{}, instanceTypes)
 					Expect(err).To(HaveOccurred())
 					Expect(poolInstance).To(BeNil())
-					Expect(err.Error()).To(ContainSubstring("creating nodeclaim"))
-					Expect(err.Error()).To(ContainSubstring("retry"))
+					Expect(err.Error()).To(ContainSubstring(retryMessage))
 					Expect(linodeEnv.LinodeAPI.CreateLKENodePoolBehavior.Calls()).To(Equal(0))
 				})
 
 				It("should return an ICE error when all attempted instance types return an ICE error", func() {
 					dedicated8GB := "g6-dedicated-4"
-					standard8GB := "g6-standard-4"
+					standard8GB := standard8GBType
 					ExpectApplied(ctx, env.Client, nodeClaim, nodePoolObj, nodeClass)
 					nodeClass = ExpectExists(ctx, env.Client, nodeClass)
 
@@ -206,13 +219,9 @@ var _ = Describe("LKENodeProvider", func() {
 				It("should create a dedicated nodepool instance", func() {
 					nodeClaim.Spec.Requirements = []karpv1.NodeSelectorRequirementWithMinValues{
 						{
-							NodeSelectorRequirement: corev1.NodeSelectorRequirement{
-								Key:      karpv1.CapacityTypeLabelKey,
-								Operator: corev1.NodeSelectorOpIn,
-								Values: []string{
-									karpv1.CapacityTypeOnDemand,
-								},
-							},
+							Key:      karpv1.CapacityTypeLabelKey,
+							Operator: corev1.NodeSelectorOpIn,
+							Values:   []string{karpv1.CapacityTypeOnDemand},
 						},
 					}
 					ExpectApplied(ctx, env.Client, nodeClaim, nodePoolObj, nodeClass)
@@ -229,8 +238,8 @@ var _ = Describe("LKENodeProvider", func() {
 					Expect(poolInstance.ID).ToNot(BeZero())
 				})
 
-				It("should include NodeClass tags in pool tags", func() {
-					nodeClass.Spec.Tags = []string{"env=production", "team=platform"}
+				It("should include NodeClass tags on claimed instances", func() {
+					nodeClass.Spec.Tags = []string{productionTag, "team=platform", "opaque-user-tag"}
 					ExpectApplied(ctx, env.Client, nodeClaim, nodePoolObj, nodeClass)
 					nodeClass = ExpectExists(ctx, env.Client, nodeClass)
 
@@ -241,8 +250,9 @@ var _ = Describe("LKENodeProvider", func() {
 					poolInstance, err := linodeEnv.LKENodeProvider.Create(ctx, nodeClass, nodeClaim, tags, instanceTypes)
 					Expect(err).ToNot(HaveOccurred())
 					Expect(poolInstance).ToNot(BeNil())
-					Expect(poolInstance.Tags).To(ContainElement("env=production"))
+					Expect(poolInstance.Tags).To(ContainElement(productionTag))
 					Expect(poolInstance.Tags).To(ContainElement("team=platform"))
+					Expect(poolInstance.Tags).To(ContainElement("opaque-user-tag"))
 				})
 
 				It("should include caller-provided tags in pool tags", func() {
@@ -275,18 +285,71 @@ var _ = Describe("LKENodeProvider", func() {
 					input := linodeEnv.LinodeAPI.CreateLKENodePoolBehavior.CalledWithInput.At(0)
 					Expect(input.Opts.Taints).To(ContainElement(linodego.LKENodePoolTaint{Key: "dedicated", Value: "gpu", Effect: linodego.LKENodePoolTaintEffect(corev1.TaintEffectNoSchedule)}))
 				})
+
+				It("should include NodeClaim labels in pool labels", func() {
+					nodeClaim.Labels["env"] = "production"
+					ExpectApplied(ctx, env.Client, nodeClaim, nodePoolObj, nodeClass)
+					nodeClass = ExpectExists(ctx, env.Client, nodeClass)
+
+					instanceTypes, err := linodeEnv.InstanceTypesProvider.List(ctx, nodeClass)
+					Expect(err).ToNot(HaveOccurred())
+
+					poolInstance, err := linodeEnv.LKENodeProvider.Create(ctx, nodeClass, nodeClaim, map[string]string{}, instanceTypes)
+					Expect(err).ToNot(HaveOccurred())
+					Expect(poolInstance).ToNot(BeNil())
+
+					input := linodeEnv.LinodeAPI.CreateLKENodePoolBehavior.CalledWithInput.At(0)
+					Expect(input.Opts.Labels[karpv1.NodePoolLabelKey]).To(Equal(nodePoolObj.Name))
+					Expect(input.Opts.Labels["env"]).To(Equal("production"))
+				})
 			})
 
 			Context("Idempotency", func() {
-				It("should reuse an existing instance by nodeclaim tag on the instance", func() {
-					poolID := 201
-					instanceID := 3001
-					nodeClaimTag := fmt.Sprintf("%s=%s", v1.NodeClaimTagKey, nodeClaim.Name)
+				It("should cap nodeclaim claim tag length for long nodeclaim names", func() {
+					poolID := 211
+					instanceID := 3016
 					poolTags := []string{
 						fmt.Sprintf("%s=%s", karpv1.NodePoolLabelKey, nodePoolObj.Name),
 						fmt.Sprintf("%s=%s", v1.LabelLKEManaged, "true"),
 					}
-					pool := &linodego.LKENodePool{ID: poolID, Type: "g6-standard-2", Tags: poolTags, Linodes: []linodego.LKENodePoolLinode{{InstanceID: instanceID, ID: "node-3001"}}}
+					pool := &linodego.LKENodePool{ID: poolID, Type: standardNodeType, Tags: poolTags, Linodes: []linodego.LKENodePoolLinode{{InstanceID: instanceID, ID: "node-3016"}}}
+					linodeEnv.LinodeAPI.NodePools.Store(fmt.Sprintf("%d-%d", fake.DefaultClusterID, poolID), pool)
+
+					now := time.Now()
+					inst := linodego.Instance{ID: instanceID, Tags: []string{}, Created: &now}
+					linodeEnv.LinodeAPI.Instances.Store(instanceID, inst)
+
+					nodeClaim.Name = "consolidation-step-scale-2lrzf-very-long-nodeclaim-name"
+					ExpectApplied(ctx, env.Client, nodeClaim, nodePoolObj, nodeClass)
+					nodeClass = ExpectExists(ctx, env.Client, nodeClass)
+					instanceTypes, err := linodeEnv.InstanceTypesProvider.List(ctx, nodeClass)
+					Expect(err).ToNot(HaveOccurred())
+
+					node, err := linodeEnv.LKENodeProvider.Create(ctx, nodeClass, nodeClaim, map[string]string{}, instanceTypes)
+					Expect(err).ToNot(HaveOccurred())
+					Expect(node).ToNot(BeNil())
+
+					updatedInst, _ := linodeEnv.LinodeAPI.Instances.Load(instanceID)
+					var nodeClaimTag string
+					for _, tag := range updatedInst.(linodego.Instance).Tags {
+						if strings.HasPrefix(tag, v1.NodeClaimTagKey+"=") {
+							nodeClaimTag = tag
+							break
+						}
+					}
+					Expect(nodeClaimTag).ToNot(BeEmpty())
+					Expect(len(nodeClaimTag)).To(BeNumerically("<=", 50))
+				})
+
+				It("should reuse an existing instance by nodeclaim tag on the instance", func() {
+					poolID := 201
+					instanceID := 3001
+					nodeClaimTag := utils.NodeClaimTag(nodeClaim.Name)
+					poolTags := []string{
+						fmt.Sprintf("%s=%s", karpv1.NodePoolLabelKey, nodePoolObj.Name),
+						fmt.Sprintf("%s=%s", v1.LabelLKEManaged, "true"),
+					}
+					pool := &linodego.LKENodePool{ID: poolID, Type: standardNodeType, Tags: poolTags, Linodes: []linodego.LKENodePoolLinode{{InstanceID: instanceID, ID: "node-3001"}}}
 					linodeEnv.LinodeAPI.NodePools.Store(fmt.Sprintf("%d-%d", fake.DefaultClusterID, poolID), pool)
 					now := time.Now()
 					inst := linodego.Instance{ID: instanceID, Tags: append(poolTags, nodeClaimTag), Created: &now}
@@ -304,7 +367,7 @@ var _ = Describe("LKENodeProvider", func() {
 					Expect(linodeEnv.LinodeAPI.CreateLKENodePoolBehavior.Calls()).To(Equal(0))
 
 					updatedInst, _ := linodeEnv.LinodeAPI.Instances.Load(instanceID)
-					Expect(updatedInst.(linodego.Instance).Tags).To(ContainElement(fmt.Sprintf("%s=%s", v1.NodeClaimTagKey, nodeClaim.Name)))
+					Expect(updatedInst.(linodego.Instance).Tags).To(ContainElement(utils.NodeClaimTag(nodeClaim.Name)))
 					Expect(updatedInst.(linodego.Instance).Tags).To(ContainElement(fmt.Sprintf("%s=%s", karpv1.NodePoolLabelKey, nodePoolObj.Name)))
 					Expect(updatedInst.(linodego.Instance).Tags).To(ContainElement(fmt.Sprintf("%s=%s", v1.LabelLKEManaged, "true")))
 				})
@@ -316,7 +379,7 @@ var _ = Describe("LKENodeProvider", func() {
 						fmt.Sprintf("%s=%s", karpv1.NodePoolLabelKey, nodePoolObj.Name),
 						fmt.Sprintf("%s=%s", v1.LabelLKEManaged, "true"),
 					}
-					pool := &linodego.LKENodePool{ID: poolID, Type: "g6-standard-2", Tags: poolTags, Linodes: []linodego.LKENodePoolLinode{{InstanceID: instanceID, ID: "node-3002"}}}
+					pool := &linodego.LKENodePool{ID: poolID, Type: standardNodeType, Tags: poolTags, Linodes: []linodego.LKENodePoolLinode{{InstanceID: instanceID, ID: "node-3002"}}}
 					linodeEnv.LinodeAPI.NodePools.Store(fmt.Sprintf("%d-%d", fake.DefaultClusterID, poolID), pool)
 
 					now := time.Now()
@@ -335,7 +398,7 @@ var _ = Describe("LKENodeProvider", func() {
 					Expect(linodeEnv.LinodeAPI.CreateLKENodePoolBehavior.Calls()).To(Equal(0))
 
 					updatedInst, _ := linodeEnv.LinodeAPI.Instances.Load(instanceID)
-					Expect(updatedInst.(linodego.Instance).Tags).To(ContainElement(fmt.Sprintf("%s=%s", v1.NodeClaimTagKey, nodeClaim.Name)))
+					Expect(updatedInst.(linodego.Instance).Tags).To(ContainElement(utils.NodeClaimTag(nodeClaim.Name)))
 					Expect(updatedInst.(linodego.Instance).Tags).ToNot(ContainElement(fmt.Sprintf("%s=%d", v1.LKENodePoolTagKey, poolID)))
 				})
 
@@ -346,7 +409,7 @@ var _ = Describe("LKENodeProvider", func() {
 						fmt.Sprintf("%s=%s", karpv1.NodePoolLabelKey, nodePoolObj.Name),
 						fmt.Sprintf("%s=%s", v1.LabelLKEManaged, "true"),
 					}
-					pool := &linodego.LKENodePool{ID: poolID, Type: "g6-standard-2", Tags: poolTags, Linodes: []linodego.LKENodePoolLinode{{InstanceID: instanceID, ID: "node-3003"}}}
+					pool := &linodego.LKENodePool{ID: poolID, Type: standardNodeType, Tags: poolTags, Linodes: []linodego.LKENodePoolLinode{{InstanceID: instanceID, ID: "node-3003"}}}
 					linodeEnv.LinodeAPI.NodePools.Store(fmt.Sprintf("%d-%d", fake.DefaultClusterID, poolID), pool)
 					now := time.Now()
 					existingTags := []string{"custom-tag=value", "another-tag=data"}
@@ -366,7 +429,7 @@ var _ = Describe("LKENodeProvider", func() {
 					tags := updatedInst.(linodego.Instance).Tags
 					Expect(tags).To(ContainElement("custom-tag=value"))
 					Expect(tags).To(ContainElement("another-tag=data"))
-					Expect(tags).To(ContainElement(fmt.Sprintf("%s=%s", v1.NodeClaimTagKey, nodeClaim.Name)))
+					Expect(tags).To(ContainElement(utils.NodeClaimTag(nodeClaim.Name)))
 					Expect(tags).To(ContainElement(fmt.Sprintf("%s=%s", karpv1.NodePoolLabelKey, nodePoolObj.Name)))
 					Expect(tags).To(ContainElement(fmt.Sprintf("%s=%s", v1.LabelLKEManaged, "true")))
 					Expect(tags).ToNot(ContainElement(fmt.Sprintf("%s=%d", v1.LKENodePoolTagKey, poolID)))
@@ -379,7 +442,7 @@ var _ = Describe("LKENodeProvider", func() {
 						fmt.Sprintf("%s=%s", karpv1.NodePoolLabelKey, nodePoolObj.Name),
 						fmt.Sprintf("%s=%s", v1.LabelLKEManaged, "true"),
 					}
-					pool := &linodego.LKENodePool{ID: poolID, Type: "g6-standard-2", Tags: poolTags, Linodes: []linodego.LKENodePoolLinode{{InstanceID: instanceID, ID: "node-3004"}}}
+					pool := &linodego.LKENodePool{ID: poolID, Type: standardNodeType, Tags: poolTags, Linodes: []linodego.LKENodePoolLinode{{InstanceID: instanceID, ID: "node-3004"}}}
 					linodeEnv.LinodeAPI.NodePools.Store(fmt.Sprintf("%d-%d", fake.DefaultClusterID, poolID), pool)
 
 					now := time.Now()
@@ -399,7 +462,7 @@ var _ = Describe("LKENodeProvider", func() {
 					tags := updatedInst.(linodego.Instance).Tags
 					Expect(tags).To(ContainElement(fmt.Sprintf("%s=%s", karpv1.NodePoolLabelKey, nodePoolObj.Name)))
 					Expect(tags).To(ContainElement(fmt.Sprintf("%s=%s", v1.LabelLKEManaged, "true")))
-					Expect(tags).To(ContainElement(fmt.Sprintf("%s=%s", v1.NodeClaimTagKey, nodeClaim.Name)))
+					Expect(tags).To(ContainElement(utils.NodeClaimTag(nodeClaim.Name)))
 					Expect(tags).ToNot(ContainElement(fmt.Sprintf("%s=%d", v1.LKENodePoolTagKey, poolID)))
 				})
 
@@ -414,7 +477,7 @@ var _ = Describe("LKENodeProvider", func() {
 					}
 					pool := &linodego.LKENodePool{
 						ID:   poolID,
-						Type: "g6-standard-2",
+						Type: standardNodeType,
 						Tags: poolTags,
 						Linodes: []linodego.LKENodePoolLinode{
 							{InstanceID: instanceID1, ID: "node-3010"},
@@ -483,7 +546,7 @@ var _ = Describe("LKENodeProvider", func() {
 						fmt.Sprintf("%s=%s", karpv1.NodePoolLabelKey, nodePoolObj.Name),
 						fmt.Sprintf("%s=%s", v1.LabelLKEManaged, "true"),
 					}
-					pool := &linodego.LKENodePool{ID: poolID, Type: "g6-standard-2", Tags: poolTags, Linodes: []linodego.LKENodePoolLinode{{InstanceID: instanceID, ID: "node-3008"}}}
+					pool := &linodego.LKENodePool{ID: poolID, Type: standardNodeType, Tags: poolTags, Linodes: []linodego.LKENodePoolLinode{{InstanceID: instanceID, ID: "node-3008"}}}
 					linodeEnv.LinodeAPI.NodePools.Store(fmt.Sprintf("%d-%d", fake.DefaultClusterID, poolID), pool)
 
 					now := time.Now()
@@ -510,7 +573,7 @@ var _ = Describe("LKENodeProvider", func() {
 						fmt.Sprintf("%s=%s", karpv1.NodePoolLabelKey, nodePoolObj.Name),
 						fmt.Sprintf("%s=%s", v1.LabelLKEManaged, "true"),
 					}
-					pool := &linodego.LKENodePool{ID: poolID, Type: "g6-standard-2", Tags: poolTags, Linodes: []linodego.LKENodePoolLinode{{InstanceID: instanceID, ID: "node-3009"}}}
+					pool := &linodego.LKENodePool{ID: poolID, Type: standardNodeType, Tags: poolTags, Linodes: []linodego.LKENodePoolLinode{{InstanceID: instanceID, ID: "node-3009"}}}
 					linodeEnv.LinodeAPI.NodePools.Store(fmt.Sprintf("%d-%d", fake.DefaultClusterID, poolID), pool)
 
 					now := time.Now()
@@ -566,7 +629,7 @@ var _ = Describe("LKENodeProvider", func() {
 						fmt.Sprintf("%s=%s", karpv1.NodePoolLabelKey, nodePoolObj.Name),
 						fmt.Sprintf("%s=%s", v1.LabelLKEManaged, "true"),
 					}
-					pool := &linodego.LKENodePool{ID: poolID, Type: "g6-standard-2", Tags: poolTags, Linodes: []linodego.LKENodePoolLinode{{InstanceID: instanceID, ID: "node-9991"}}}
+					pool := &linodego.LKENodePool{ID: poolID, Type: standardNodeType, Tags: poolTags, Linodes: []linodego.LKENodePoolLinode{{InstanceID: instanceID, ID: "node-9991"}}}
 					linodeEnv.LinodeAPI.NodePools.Store(fmt.Sprintf("%d-%d", fake.DefaultClusterID, poolID), pool)
 
 					linodeEnv.LinodeAPI.GetInstanceBehavior.Error.Set(&linodego.Error{Code: http.StatusServiceUnavailable, Message: "retry"}, fake.MaxCalls(0))
@@ -613,11 +676,7 @@ var _ = Describe("LKENodeProvider", func() {
 			Context("Create options", func() {
 				It("should propagate optional NodeClass fields", func() {
 					firewallID := 123
-					version := "1.29"
-					strategy := linodego.LKENodePoolUpdateStrategy("rolling_update")
 					nodeClass.Spec.FirewallID = lo.ToPtr(firewallID)
-					nodeClass.Spec.LKEK8sVersion = lo.ToPtr(version)
-					nodeClass.Spec.LKEUpdateStrategy = &strategy
 
 					ExpectApplied(ctx, env.Client, nodeClaim, nodePoolObj, nodeClass)
 					nodeClass = ExpectExists(ctx, env.Client, nodeClass)
@@ -629,11 +688,10 @@ var _ = Describe("LKENodeProvider", func() {
 					input := linodeEnv.LinodeAPI.CreateLKENodePoolBehavior.CalledWithInput.At(0)
 					Expect(input.Opts.FirewallID).ToNot(BeNil())
 					Expect(*input.Opts.FirewallID).To(Equal(firewallID))
-					Expect(input.Opts.K8sVersion).ToNot(BeNil())
-					Expect(*input.Opts.K8sVersion).To(Equal(version))
-					Expect(input.Opts.UpdateStrategy).ToNot(BeNil())
-					Expect(*input.Opts.UpdateStrategy).To(Equal(strategy))
+					Expect(input.Opts.K8sVersion).To(BeNil())
+					Expect(input.Opts.UpdateStrategy).To(BeNil())
 				})
+
 			})
 		})
 
@@ -646,7 +704,7 @@ var _ = Describe("LKENodeProvider", func() {
 
 			Context("Create", func() {
 				It("should surface instance lookup errors", func() {
-					linodeEnv.LinodeAPI.ListInstancesBehavior.Error.Set(&linodego.Error{Code: http.StatusServiceUnavailable, Message: "retry"})
+					linodeEnv.LinodeAPI.ListInstancesBehavior.Error.Set(&linodego.Error{Code: http.StatusServiceUnavailable, Message: retryMessage})
 
 					ExpectApplied(ctx, env.Client, nodeClaim, nodePoolObj, nodeClass)
 					nodeClass = ExpectExists(ctx, env.Client, nodeClass)
@@ -656,14 +714,13 @@ var _ = Describe("LKENodeProvider", func() {
 					poolInstance, err := enterpriseProvider.Create(ctx, nodeClass, nodeClaim, map[string]string{}, instanceTypes)
 					Expect(err).To(HaveOccurred())
 					Expect(poolInstance).To(BeNil())
-					Expect(err.Error()).To(ContainSubstring("creating nodeclaim"))
-					Expect(err.Error()).To(ContainSubstring("retry"))
+					Expect(err.Error()).To(ContainSubstring(retryMessage))
 					Expect(linodeEnv.LinodeAPI.CreateLKENodePoolBehavior.Calls()).To(Equal(0))
 				})
 
 				It("should return an ICE error when all attempted instance types return an ICE error", func() {
 					dedicated8GB := "g6-dedicated-4"
-					standard8GB := "g6-standard-4"
+					standard8GB := standard8GBType
 					ExpectApplied(ctx, env.Client, nodeClaim, nodePoolObj, nodeClass)
 					nodeClass = ExpectExists(ctx, env.Client, nodeClass)
 
@@ -683,7 +740,13 @@ var _ = Describe("LKENodeProvider", func() {
 				})
 
 				It("should create a dedicated nodepool instance", func() {
-					nodeClaim.Spec.Requirements = []karpv1.NodeSelectorRequirementWithMinValues{{NodeSelectorRequirement: corev1.NodeSelectorRequirement{Key: karpv1.CapacityTypeLabelKey, Operator: corev1.NodeSelectorOpIn, Values: []string{karpv1.CapacityTypeOnDemand}}}}
+					nodeClaim.Spec.Requirements = []karpv1.NodeSelectorRequirementWithMinValues{
+						{
+							Key:      karpv1.CapacityTypeLabelKey,
+							Operator: corev1.NodeSelectorOpIn,
+							Values:   []string{karpv1.CapacityTypeOnDemand},
+						},
+					}
 					ExpectApplied(ctx, env.Client, nodeClaim, nodePoolObj, nodeClass)
 					nodeClass = ExpectExists(ctx, env.Client, nodeClass)
 
@@ -694,7 +757,7 @@ var _ = Describe("LKENodeProvider", func() {
 					poolID := 100
 					instanceID := 1000 + poolID*10
 					now := time.Now()
-					claimable := linodego.Instance{ID: instanceID, Type: cheapestType.Name, Label: "node-0", Tags: enterpriseInstanceTags(nodePoolObj.Name, poolID), Created: &now, LKEClusterID: fake.DefaultClusterID}
+					claimable := linodego.Instance{ID: instanceID, Type: cheapestType.Name, Label: defaultNodeLabel, Tags: enterpriseInstanceTags(nodePoolObj.Name, poolID), Created: &now, LKEClusterID: fake.DefaultClusterID}
 					enqueueListInstances(linodeEnv, []linodego.Instance{}, []linodego.Instance{claimable})
 
 					poolInstance, err := enterpriseProvider.Create(ctx, nodeClass, nodeClaim, map[string]string{}, instanceTypes)
@@ -704,8 +767,8 @@ var _ = Describe("LKENodeProvider", func() {
 					Expect(poolInstance.ID).ToNot(BeZero())
 				})
 
-				It("should include NodeClass tags in pool tags", func() {
-					nodeClass.Spec.Tags = []string{"env=production", "team=platform"}
+				It("should keep NodeClass tags off the pool and apply them to claimed instances", func() {
+					nodeClass.Spec.Tags = []string{productionTag, "team=platform", "opaque-user-tag"}
 					ExpectApplied(ctx, env.Client, nodeClaim, nodePoolObj, nodeClass)
 					nodeClass = ExpectExists(ctx, env.Client, nodeClass)
 
@@ -716,16 +779,104 @@ var _ = Describe("LKENodeProvider", func() {
 					poolID := 100
 					instanceID := 1000 + poolID*10
 					now := time.Now()
-					claimable := linodego.Instance{ID: instanceID, Type: cheapestType.Name, Label: "node-0", Tags: enterpriseInstanceTags(nodePoolObj.Name, poolID), Created: &now, LKEClusterID: fake.DefaultClusterID}
+					claimable := linodego.Instance{ID: instanceID, Type: cheapestType.Name, Label: defaultNodeLabel, Tags: enterpriseInstanceTags(nodePoolObj.Name, poolID), Created: &now, LKEClusterID: fake.DefaultClusterID}
 					enqueueListInstances(linodeEnv, []linodego.Instance{}, []linodego.Instance{claimable})
 
 					poolInstance, err := enterpriseProvider.Create(ctx, nodeClass, nodeClaim, map[string]string{}, instanceTypes)
 					Expect(err).ToNot(HaveOccurred())
 					Expect(poolInstance).ToNot(BeNil())
+					Expect(poolInstance.Tags).To(ContainElement(productionTag))
+					Expect(poolInstance.Tags).To(ContainElement("team=platform"))
+					Expect(poolInstance.Tags).To(ContainElement("opaque-user-tag"))
 
 					input := linodeEnv.LinodeAPI.CreateLKENodePoolBehavior.CalledWithInput.At(0)
-					Expect(input.Opts.Tags).To(ContainElement("env=production"))
-					Expect(input.Opts.Tags).To(ContainElement("team=platform"))
+					Expect(input.Opts.Tags).ToNot(ContainElement("env=production"))
+					Expect(input.Opts.Tags).ToNot(ContainElement("team=platform"))
+					Expect(input.Opts.Tags).ToNot(ContainElement("opaque-user-tag"))
+				})
+
+				It("should handle tag conflicts with correct precedence (pool > nodeClass > instance)", func() {
+					nodeClass.Spec.Tags = []string{productionTag, "conflict=nodeclass-value"}
+					ExpectApplied(ctx, env.Client, nodeClaim, nodePoolObj, nodeClass)
+					nodeClass = ExpectExists(ctx, env.Client, nodeClass)
+
+					instanceTypes, err := linodeEnv.InstanceTypesProvider.List(ctx, nodeClass)
+					Expect(err).ToNot(HaveOccurred())
+					cheapestType, err := utils.CheapestInstanceType(instanceTypes)
+					Expect(err).ToNot(HaveOccurred())
+					poolID := 100
+					instanceID := 1000 + poolID*10
+					now := time.Now()
+					// Instance has a conflicting KV tag
+					instanceTags := append(enterpriseInstanceTags(nodePoolObj.Name, poolID), "conflict=instance-value")
+					claimable := linodego.Instance{ID: instanceID, Type: cheapestType.Name, Label: defaultNodeLabel, Tags: instanceTags, Created: &now, LKEClusterID: fake.DefaultClusterID}
+					enqueueListInstances(linodeEnv, []linodego.Instance{}, []linodego.Instance{claimable})
+
+					poolInstance, err := enterpriseProvider.Create(ctx, nodeClass, nodeClaim, map[string]string{}, instanceTypes)
+					Expect(err).ToNot(HaveOccurred())
+					Expect(poolInstance).ToNot(BeNil())
+					// NodeClass tag should override instance tag
+					Expect(poolInstance.Tags).To(ContainElement("conflict=nodeclass-value"))
+					Expect(poolInstance.Tags).ToNot(ContainElement("conflict=instance-value"))
+					// Other tags should be preserved
+					Expect(poolInstance.Tags).To(ContainElement(productionTag))
+				})
+
+				It("should preserve instance opaque tags when claiming", func() {
+					nodeClass.Spec.Tags = []string{productionTag}
+					ExpectApplied(ctx, env.Client, nodeClaim, nodePoolObj, nodeClass)
+					nodeClass = ExpectExists(ctx, env.Client, nodeClass)
+
+					instanceTypes, err := linodeEnv.InstanceTypesProvider.List(ctx, nodeClass)
+					Expect(err).ToNot(HaveOccurred())
+					cheapestType, err := utils.CheapestInstanceType(instanceTypes)
+					Expect(err).ToNot(HaveOccurred())
+					poolID := 100
+					instanceID := 1000 + poolID*10
+					now := time.Now()
+					// Instance has opaque tags that should be preserved
+					instanceTags := append(enterpriseInstanceTags(nodePoolObj.Name, poolID), "custom-opaque-tag-1", "custom-opaque-tag-2")
+					claimable := linodego.Instance{ID: instanceID, Type: cheapestType.Name, Label: defaultNodeLabel, Tags: instanceTags, Created: &now, LKEClusterID: fake.DefaultClusterID}
+					enqueueListInstances(linodeEnv, []linodego.Instance{}, []linodego.Instance{claimable})
+
+					poolInstance, err := enterpriseProvider.Create(ctx, nodeClass, nodeClaim, map[string]string{}, instanceTypes)
+					Expect(err).ToNot(HaveOccurred())
+					Expect(poolInstance).ToNot(BeNil())
+					// Opaque tags from instance should be preserved
+					Expect(poolInstance.Tags).To(ContainElement("custom-opaque-tag-1"))
+					Expect(poolInstance.Tags).To(ContainElement("custom-opaque-tag-2"))
+					// NodeClass tags should also be added
+					Expect(poolInstance.Tags).To(ContainElement(productionTag))
+				})
+
+				It("should deduplicate tags when sources have duplicates", func() {
+					nodeClass.Spec.Tags = []string{productionTag, "dedup=test"}
+					ExpectApplied(ctx, env.Client, nodeClaim, nodePoolObj, nodeClass)
+					nodeClass = ExpectExists(ctx, env.Client, nodeClass)
+
+					instanceTypes, err := linodeEnv.InstanceTypesProvider.List(ctx, nodeClass)
+					Expect(err).ToNot(HaveOccurred())
+					cheapestType, err := utils.CheapestInstanceType(instanceTypes)
+					Expect(err).ToNot(HaveOccurred())
+					poolID := 100
+					instanceID := 1000 + poolID*10
+					now := time.Now()
+					// Instance has the same KV tag as nodeClass
+					instanceTags := append(enterpriseInstanceTags(nodePoolObj.Name, poolID), "dedup=test")
+					claimable := linodego.Instance{ID: instanceID, Type: cheapestType.Name, Label: defaultNodeLabel, Tags: instanceTags, Created: &now, LKEClusterID: fake.DefaultClusterID}
+					enqueueListInstances(linodeEnv, []linodego.Instance{}, []linodego.Instance{claimable})
+
+					poolInstance, err := enterpriseProvider.Create(ctx, nodeClass, nodeClaim, map[string]string{}, instanceTypes)
+					Expect(err).ToNot(HaveOccurred())
+					Expect(poolInstance).ToNot(BeNil())
+					// Tag should appear only once
+					count := 0
+					for _, tag := range poolInstance.Tags {
+						if tag == "dedup=test" {
+							count++
+						}
+					}
+					Expect(count).To(Equal(1))
 				})
 
 				It("should include caller-provided tags in pool tags", func() {
@@ -739,7 +890,7 @@ var _ = Describe("LKENodeProvider", func() {
 					poolID := 100
 					instanceID := 1000 + poolID*10
 					now := time.Now()
-					claimable := linodego.Instance{ID: instanceID, Type: cheapestType.Name, Label: "node-0", Tags: enterpriseInstanceTags(nodePoolObj.Name, poolID), Created: &now, LKEClusterID: fake.DefaultClusterID}
+					claimable := linodego.Instance{ID: instanceID, Type: cheapestType.Name, Label: defaultNodeLabel, Tags: enterpriseInstanceTags(nodePoolObj.Name, poolID), Created: &now, LKEClusterID: fake.DefaultClusterID}
 					enqueueListInstances(linodeEnv, []linodego.Instance{}, []linodego.Instance{claimable})
 
 					poolInstance, err := enterpriseProvider.Create(ctx, nodeClass, nodeClaim, map[string]string{"integration": "true"}, instanceTypes)
@@ -773,15 +924,39 @@ var _ = Describe("LKENodeProvider", func() {
 					Expect(input.Opts.Taints).To(ContainElement(linodego.LKENodePoolTaint{Key: "dedicated", Value: "gpu", Effect: linodego.LKENodePoolTaintEffect(corev1.TaintEffectNoSchedule)}))
 				})
 
+				It("should include NodeClaim labels in lke nodepool labels", func() {
+					nodeClaim.Labels["env"] = "production"
+					ExpectApplied(ctx, env.Client, nodeClaim, nodePoolObj, nodeClass)
+					nodeClass = ExpectExists(ctx, env.Client, nodeClass)
+
+					instanceTypes, err := linodeEnv.InstanceTypesProvider.List(ctx, nodeClass)
+					Expect(err).ToNot(HaveOccurred())
+					cheapestType, err := utils.CheapestInstanceType(instanceTypes)
+					Expect(err).ToNot(HaveOccurred())
+					poolID := 100
+					instanceID := 1000 + poolID*10
+					now := time.Now()
+					claimable := linodego.Instance{ID: instanceID, Type: cheapestType.Name, Label: "node-0", Tags: enterpriseInstanceTags(nodePoolObj.Name, poolID), Created: &now, LKEClusterID: fake.DefaultClusterID}
+					enqueueListInstances(linodeEnv, []linodego.Instance{}, []linodego.Instance{claimable})
+
+					poolInstance, err := enterpriseProvider.Create(ctx, nodeClass, nodeClaim, map[string]string{}, instanceTypes)
+					Expect(err).ToNot(HaveOccurred())
+					Expect(poolInstance).ToNot(BeNil())
+
+					input := linodeEnv.LinodeAPI.CreateLKENodePoolBehavior.CalledWithInput.At(0)
+					Expect(input.Opts.Labels[karpv1.NodePoolLabelKey]).To(Equal(nodePoolObj.Name))
+					Expect(input.Opts.Labels["env"]).To(Equal("production"))
+				})
+
 				It("should find existing instance by tag in enterprise tier", func() {
 					poolID := 203
 					instanceID := 7001
-					nodeClaimTag := fmt.Sprintf("%s=%s", v1.NodeClaimTagKey, nodeClaim.Name)
+					nodeClaimTag := utils.NodeClaimTag(nodeClaim.Name)
 					poolTags := []string{
 						fmt.Sprintf("%s=%s", karpv1.NodePoolLabelKey, nodePoolObj.Name),
 						fmt.Sprintf("%s=%s", v1.LabelLKEManaged, "true"),
 					}
-					pool := &linodego.LKENodePool{ID: poolID, Type: "g6-standard-2", Tags: poolTags, Linodes: []linodego.LKENodePoolLinode{{InstanceID: instanceID, ID: "node-7001"}}}
+					pool := &linodego.LKENodePool{ID: poolID, Type: standardNodeType, Tags: poolTags, Linodes: []linodego.LKENodePoolLinode{{InstanceID: instanceID, ID: "node-7001"}}}
 					linodeEnv.LinodeAPI.NodePools.Store(fmt.Sprintf("%d-%d", fake.DefaultClusterID, poolID), pool)
 
 					now := time.Now()
@@ -806,7 +981,7 @@ var _ = Describe("LKENodeProvider", func() {
 						fmt.Sprintf("%s=%s", karpv1.NodePoolLabelKey, nodePoolObj.Name),
 						fmt.Sprintf("%s=%s", v1.LabelLKEManaged, "true"),
 					}
-					pool := &linodego.LKENodePool{ID: poolID, Type: "g6-standard-2", Tags: poolTags, Linodes: []linodego.LKENodePoolLinode{{InstanceID: instanceID, ID: "node-7002"}}}
+					pool := &linodego.LKENodePool{ID: poolID, Type: standardNodeType, Tags: poolTags, Linodes: []linodego.LKENodePoolLinode{{InstanceID: instanceID, ID: "node-7002"}}}
 					linodeEnv.LinodeAPI.NodePools.Store(fmt.Sprintf("%d-%d", fake.DefaultClusterID, poolID), pool)
 
 					now := time.Now()
@@ -823,9 +998,9 @@ var _ = Describe("LKENodeProvider", func() {
 				It("should reuse an existing instance by nodeclaim tag on the instance", func() {
 					poolID := 201
 					instanceID := 3001
-					nodeClaimTag := fmt.Sprintf("%s=%s", v1.NodeClaimTagKey, nodeClaim.Name)
+					nodeClaimTag := utils.NodeClaimTag(nodeClaim.Name)
 					poolTags := enterprisePoolTags(nodePoolObj.Name)
-					pool := &linodego.LKENodePool{ID: poolID, Type: "g6-standard-2", Tags: poolTags, Linodes: []linodego.LKENodePoolLinode{{InstanceID: instanceID, ID: "node-3001"}}}
+					pool := &linodego.LKENodePool{ID: poolID, Type: standardNodeType, Tags: poolTags, Linodes: []linodego.LKENodePoolLinode{{InstanceID: instanceID, ID: "node-3001"}}}
 					linodeEnv.LinodeAPI.NodePools.Store(fmt.Sprintf("%d-%d", fake.DefaultClusterID, poolID), pool)
 
 					now := time.Now()
@@ -877,7 +1052,7 @@ var _ = Describe("LKENodeProvider", func() {
 
 					updatedInst, _ := linodeEnv.LinodeAPI.Instances.Load(instanceID)
 					tags := updatedInst.(linodego.Instance).Tags
-					Expect(tags).To(ContainElement(fmt.Sprintf("%s=%s", v1.NodeClaimTagKey, nodeClaim.Name)))
+					Expect(tags).To(ContainElement(utils.NodeClaimTag(nodeClaim.Name)))
 					Expect(tags).To(ContainElement(fmt.Sprintf("%s=%s", karpv1.NodePoolLabelKey, nodePoolObj.Name)))
 					Expect(tags).To(ContainElement(fmt.Sprintf("%s=%s", v1.LabelLKEManaged, "true")))
 					Expect(tags).To(ContainElement(fmt.Sprintf("%s=%d", v1.LKENodePoolTagKey, poolID)))
@@ -915,7 +1090,7 @@ var _ = Describe("LKENodeProvider", func() {
 					tags := updatedInst.(linodego.Instance).Tags
 					Expect(tags).To(ContainElement("custom-tag=value"))
 					Expect(tags).To(ContainElement("another-tag=data"))
-					Expect(tags).To(ContainElement(fmt.Sprintf("%s=%s", v1.NodeClaimTagKey, nodeClaim.Name)))
+					Expect(tags).To(ContainElement(utils.NodeClaimTag(nodeClaim.Name)))
 					Expect(tags).To(ContainElement(fmt.Sprintf("%s=%s", karpv1.NodePoolLabelKey, nodePoolObj.Name)))
 					Expect(tags).To(ContainElement(fmt.Sprintf("%s=%s", v1.LabelLKEManaged, "true")))
 					Expect(tags).To(ContainElement(fmt.Sprintf("%s=%d", v1.LKENodePoolTagKey, poolID)))
@@ -948,7 +1123,7 @@ var _ = Describe("LKENodeProvider", func() {
 
 					updatedInst, _ := linodeEnv.LinodeAPI.Instances.Load(instanceID)
 					tags := updatedInst.(linodego.Instance).Tags
-					Expect(tags).To(ContainElement(fmt.Sprintf("%s=%s", v1.NodeClaimTagKey, nodeClaim.Name)))
+					Expect(tags).To(ContainElement(utils.NodeClaimTag(nodeClaim.Name)))
 					Expect(tags).To(ContainElement(fmt.Sprintf("%s=%s", karpv1.NodePoolLabelKey, nodePoolObj.Name)))
 					Expect(tags).To(ContainElement(fmt.Sprintf("%s=%s", v1.LabelLKEManaged, "true")))
 					Expect(tags).To(ContainElement(fmt.Sprintf("%s=%d", v1.LKENodePoolTagKey, poolID)))
@@ -1105,7 +1280,6 @@ var _ = Describe("LKENodeProvider", func() {
 					poolInstance, err := enterpriseProvider.Create(ctx, nodeClass, nodeClaim, map[string]string{}, instanceTypes)
 					Expect(err).To(HaveOccurred())
 					Expect(poolInstance).To(BeNil())
-					Expect(err.Error()).To(ContainSubstring("creating nodeclaim"))
 					Expect(err.Error()).To(ContainSubstring("missing"))
 					Expect(linodeEnv.LinodeAPI.CreateLKENodePoolBehavior.Calls()).To(Equal(0))
 				})
@@ -1121,7 +1295,6 @@ var _ = Describe("LKENodeProvider", func() {
 					poolInstance, err := enterpriseProvider.Create(ctx, nodeClass, nodeClaim, map[string]string{}, instanceTypes)
 					Expect(err).To(HaveOccurred())
 					Expect(poolInstance).To(BeNil())
-					Expect(err.Error()).To(ContainSubstring("creating nodeclaim"))
 					Expect(err.Error()).To(ContainSubstring("list fail"))
 				})
 			})
@@ -1158,11 +1331,9 @@ var _ = Describe("LKENodeProvider", func() {
 			Context("Create options", func() {
 				It("should propagate optional NodeClass fields", func() {
 					firewallID := 123
-					version := "1.29"
-					strategy := linodego.LKENodePoolUpdateStrategy("rolling_update")
+					version := fake.DefaultClusterVersion
 					nodeClass.Spec.FirewallID = lo.ToPtr(firewallID)
 					nodeClass.Spec.LKEK8sVersion = lo.ToPtr(version)
-					nodeClass.Spec.LKEUpdateStrategy = &strategy
 
 					ExpectApplied(ctx, env.Client, nodeClaim, nodePoolObj, nodeClass)
 					nodeClass = ExpectExists(ctx, env.Client, nodeClass)
@@ -1186,8 +1357,50 @@ var _ = Describe("LKENodeProvider", func() {
 					Expect(input.Opts.K8sVersion).ToNot(BeNil())
 					Expect(*input.Opts.K8sVersion).To(Equal(version))
 					Expect(input.Opts.UpdateStrategy).ToNot(BeNil())
-					Expect(*input.Opts.UpdateStrategy).To(Equal(strategy))
+					Expect(*input.Opts.UpdateStrategy).To(Equal(linodego.LKENodePoolOnRecycle))
 				})
+
+				It("should update an existing pool to the desired kubernetes version before reuse", func() {
+					version := fake.DefaultClusterVersion
+					nodeClass.Spec.LKEK8sVersion = lo.ToPtr(version)
+
+					ExpectApplied(ctx, env.Client, nodeClaim, nodePoolObj, nodeClass)
+					nodeClass = ExpectExists(ctx, env.Client, nodeClass)
+					instanceTypes, err := linodeEnv.InstanceTypesProvider.List(ctx, nodeClass)
+					Expect(err).ToNot(HaveOccurred())
+					cheapestType, err := utils.CheapestInstanceType(instanceTypes)
+					Expect(err).ToNot(HaveOccurred())
+
+					poolID := 301
+					poolTags := enterprisePoolTags(nodePoolObj.Name)
+					oldVersion := "1.30"
+					linodeEnv.LinodeAPI.NodePools.Store(
+						fmt.Sprintf("%d-%d", fake.DefaultClusterID, poolID),
+						&linodego.LKENodePool{ID: poolID, Type: cheapestType.Name, Count: 1, Tags: poolTags, K8sVersion: lo.ToPtr(oldVersion)},
+					)
+
+					now := time.Now()
+					claimable := linodego.Instance{
+						ID:           1000 + poolID*10,
+						Type:         cheapestType.Name,
+						Label:        "node-0",
+						Tags:         enterpriseInstanceTags(nodePoolObj.Name, poolID),
+						Created:      &now,
+						LKEClusterID: fake.DefaultClusterID,
+					}
+					linodeEnv.LinodeAPI.Instances.Store(claimable.ID, claimable)
+					enqueueListInstances(linodeEnv, []linodego.Instance{}, []linodego.Instance{claimable})
+
+					_, err = enterpriseProvider.Create(ctx, nodeClass, nodeClaim, map[string]string{}, instanceTypes)
+					Expect(err).ToNot(HaveOccurred())
+
+					input := linodeEnv.LinodeAPI.UpdateLKENodePoolBehavior.CalledWithInput.At(0)
+					Expect(input.Opts.K8sVersion).ToNot(BeNil())
+					Expect(*input.Opts.K8sVersion).To(Equal(version))
+					Expect(input.Opts.UpdateStrategy).ToNot(BeNil())
+					Expect(*input.Opts.UpdateStrategy).To(Equal(linodego.LKENodePoolOnRecycle))
+				})
+
 			})
 		})
 	})
@@ -1245,7 +1458,7 @@ var _ = Describe("LKENodeProvider", func() {
 				poolID := 1301
 				instanceID := 2301
 				poolTags := enterprisePoolTags(nodePoolObj.Name)
-				pool := &linodego.LKENodePool{ID: poolID, Type: "g6-standard-2", Tags: poolTags, Linodes: []linodego.LKENodePoolLinode{{InstanceID: instanceID, ID: "node-2301"}}}
+				pool := &linodego.LKENodePool{ID: poolID, Type: standardNodeType, Tags: poolTags, Linodes: []linodego.LKENodePoolLinode{{InstanceID: instanceID, ID: "node-2301"}}}
 				linodeEnv.LinodeAPI.NodePools.Store(fmt.Sprintf("%d-%d", fake.DefaultClusterID, poolID), pool)
 
 				now := time.Now()
@@ -1293,7 +1506,7 @@ var _ = Describe("LKENodeProvider", func() {
 				}
 				pool := &linodego.LKENodePool{
 					ID:   poolID,
-					Type: "g6-standard-4",
+					Type: standard8GBType,
 					Tags: poolTags,
 					Linodes: []linodego.LKENodePoolLinode{
 						{InstanceID: instanceID1, ID: "node-4001"},
@@ -1348,7 +1561,7 @@ var _ = Describe("LKENodeProvider", func() {
 				poolTags2 := enterprisePoolTags(nodePoolObj.Name)
 				pool1 := &linodego.LKENodePool{
 					ID:   poolID1,
-					Type: "g6-standard-4",
+					Type: standard8GBType,
 					Tags: poolTags1,
 					Linodes: []linodego.LKENodePoolLinode{
 						{InstanceID: instanceID1, ID: "node-4301"},
@@ -1356,7 +1569,7 @@ var _ = Describe("LKENodeProvider", func() {
 				}
 				pool2 := &linodego.LKENodePool{
 					ID:   poolID2,
-					Type: "g6-standard-4",
+					Type: standard8GBType,
 					Tags: poolTags2,
 					Linodes: []linodego.LKENodePoolLinode{
 						{InstanceID: instanceID2, ID: "node-4302"},
@@ -1410,7 +1623,7 @@ var _ = Describe("LKENodeProvider", func() {
 				}
 				pool := &linodego.LKENodePool{
 					ID:   poolID,
-					Type: "g6-standard-4",
+					Type: standard8GBType,
 					Tags: poolTags,
 					Linodes: []linodego.LKENodePoolLinode{
 						{InstanceID: instanceID1, ID: "node-5001"},
@@ -1419,7 +1632,7 @@ var _ = Describe("LKENodeProvider", func() {
 				}
 				linodeEnv.LinodeAPI.NodePools.Store(fmt.Sprintf("%d-%d", fake.DefaultClusterID, poolID), pool)
 				now := time.Now()
-				inst := linodego.Instance{ID: instanceID1, Tags: append(poolTags, fmt.Sprintf("%s=%s", v1.NodeClaimTagKey, nodeClaim.Name)), Created: &now}
+				inst := linodego.Instance{ID: instanceID1, Tags: append(poolTags, utils.NodeClaimTag(nodeClaim.Name)), Created: &now}
 				linodeEnv.LinodeAPI.Instances.Store(instanceID1, inst)
 				inst2 := linodego.Instance{ID: instanceID2, Tags: append(poolTags, fmt.Sprintf("%s=%s", v1.NodeClaimTagKey, "other")), Created: &now}
 				linodeEnv.LinodeAPI.Instances.Store(instanceID2, inst2)
@@ -1440,7 +1653,7 @@ var _ = Describe("LKENodeProvider", func() {
 				}
 				pool := &linodego.LKENodePool{
 					ID:   poolID,
-					Type: "g6-standard-4",
+					Type: standard8GBType,
 					Tags: poolTags,
 					Linodes: []linodego.LKENodePoolLinode{
 						{InstanceID: instanceID, ID: "node-5003"},
@@ -1448,7 +1661,7 @@ var _ = Describe("LKENodeProvider", func() {
 				}
 				linodeEnv.LinodeAPI.NodePools.Store(fmt.Sprintf("%d-%d", fake.DefaultClusterID, poolID), pool)
 				now := time.Now()
-				inst := linodego.Instance{ID: instanceID, Tags: append(poolTags, fmt.Sprintf("%s=%s", v1.NodeClaimTagKey, nodeClaim.Name)), Created: &now}
+				inst := linodego.Instance{ID: instanceID, Tags: append(poolTags, utils.NodeClaimTag(nodeClaim.Name)), Created: &now}
 				linodeEnv.LinodeAPI.Instances.Store(instanceID, inst)
 
 				err := linodeEnv.LKENodeProvider.Delete(ctx, strconv.Itoa(instanceID))
@@ -1474,7 +1687,7 @@ var _ = Describe("LKENodeProvider", func() {
 				linodeEnv.LinodeAPI.DeleteLKENodePoolBehavior.Error.Set(fmt.Errorf("delete fail"))
 
 				now := time.Now()
-				inst := linodego.Instance{ID: 888, Tags: append(pool.Tags, fmt.Sprintf("%s=%s", v1.NodeClaimTagKey, nodeClaim.Name)), Created: &now}
+				inst := linodego.Instance{ID: 888, Tags: append(pool.Tags, utils.NodeClaimTag(nodeClaim.Name)), Created: &now}
 				linodeEnv.LinodeAPI.Instances.Store(inst.ID, inst)
 
 				err := linodeEnv.LKENodeProvider.Delete(ctx, "888")
@@ -1497,7 +1710,7 @@ var _ = Describe("LKENodeProvider", func() {
 				poolTags := enterprisePoolTags(nodePoolObj.Name)
 				pool := &linodego.LKENodePool{
 					ID:   poolID,
-					Type: "g6-standard-4",
+					Type: standard8GBType,
 					Tags: poolTags,
 					Linodes: []linodego.LKENodePoolLinode{
 						{InstanceID: instanceID1, ID: "node-5101"},
@@ -1524,7 +1737,7 @@ var _ = Describe("LKENodeProvider", func() {
 				poolTags := enterprisePoolTags(nodePoolObj.Name)
 				pool := &linodego.LKENodePool{
 					ID:   poolID,
-					Type: "g6-standard-4",
+					Type: standard8GBType,
 					Tags: poolTags,
 					Linodes: []linodego.LKENodePoolLinode{
 						{InstanceID: instanceID, ID: "node-5103"},
@@ -1582,7 +1795,7 @@ var _ = Describe("LKENodeProvider", func() {
 			}
 			pool := &linodego.LKENodePool{
 				ID:      poolID,
-				Type:    "g6-standard-4",
+				Type:    standard8GBType,
 				Tags:    poolTags,
 				Linodes: []linodego.LKENodePoolLinode{{InstanceID: instanceID, ID: "node-6001"}},
 			}
@@ -1613,7 +1826,7 @@ var _ = Describe("LKENodeProvider", func() {
 		})
 
 		It("should return error for invalid instance ID", func() {
-			err := linodeEnv.LKENodeProvider.CreateTags(ctx, "bad-id", map[string]string{"foo": "bar"})
+			err := linodeEnv.LKENodeProvider.CreateTags(ctx, "bad-id", map[string]string{fooKey: barValue})
 			Expect(err).To(HaveOccurred())
 			Expect(err.Error()).To(ContainSubstring("parsing instance ID"))
 		})
@@ -1621,7 +1834,7 @@ var _ = Describe("LKENodeProvider", func() {
 		It("should surface errors when fetching instance", func() {
 			linodeEnv.LinodeAPI.GetInstanceBehavior.Error.Set(fmt.Errorf("get fail"))
 
-			err := linodeEnv.LKENodeProvider.CreateTags(ctx, "2001", map[string]string{"foo": "bar"})
+			err := linodeEnv.LKENodeProvider.CreateTags(ctx, "2001", map[string]string{fooKey: barValue})
 			Expect(err).To(HaveOccurred())
 			Expect(err.Error()).To(ContainSubstring("get fail"))
 		})
@@ -1633,7 +1846,7 @@ var _ = Describe("LKENodeProvider", func() {
 			linodeEnv.LinodeAPI.Instances.Store(instanceID, inst)
 			linodeEnv.LinodeAPI.UpdateInstanceBehavior.Error.Set(fmt.Errorf("boom"))
 
-			err := linodeEnv.LKENodeProvider.CreateTags(ctx, strconv.Itoa(instanceID), map[string]string{"foo": "bar"})
+			err := linodeEnv.LKENodeProvider.CreateTags(ctx, strconv.Itoa(instanceID), map[string]string{fooKey: barValue})
 			Expect(err).To(HaveOccurred())
 			Expect(err.Error()).To(ContainSubstring("boom"))
 		})

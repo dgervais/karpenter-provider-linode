@@ -30,6 +30,8 @@ import (
 	nodeclaimgarbagecollection "github.com/linode/karpenter-provider-linode/pkg/controllers/nodeclaim/garbagecollection"
 	nodeclaimtagging "github.com/linode/karpenter-provider-linode/pkg/controllers/nodeclaim/tagging"
 	"github.com/linode/karpenter-provider-linode/pkg/controllers/nodeclass"
+	nodeclasshash "github.com/linode/karpenter-provider-linode/pkg/controllers/nodeclass/hash"
+	nodeclassinplaceupdate "github.com/linode/karpenter-provider-linode/pkg/controllers/nodeclass/inplaceupdate"
 	controllersinstancetype "github.com/linode/karpenter-provider-linode/pkg/controllers/providers/instancetype"
 	controllersinstancetypecapacity "github.com/linode/karpenter-provider-linode/pkg/controllers/providers/instancetype/capacity"
 	sdk "github.com/linode/karpenter-provider-linode/pkg/linode"
@@ -41,6 +43,7 @@ import (
 func NewControllers(
 	ctx context.Context,
 	region string,
+	clusterID int,
 	mgr manager.Manager,
 	linodeClient sdk.LinodeAPI,
 	kubeClient client.Client,
@@ -50,22 +53,26 @@ func NewControllers(
 	nodeProvider instance.Provider,
 	instanceTypeProvider *instancetype.DefaultProvider,
 ) []controller.Controller {
-	return []controller.Controller{
+	controllers := []controller.Controller{
 		nodeclass.NewController(
 			kubeClient,
 			cloudProvider,
 			recorder,
 			region,
+			clusterID,
 			instanceTypeProvider,
 			linodeClient,
 			validationCache,
 			options.FromContext(ctx).DisableDryRun,
 		),
+		nodeclasshash.NewController(kubeClient),
 		nodeclaimgarbagecollection.NewController(kubeClient, cloudProvider),
 		nodeclaimtagging.NewController(kubeClient, cloudProvider, nodeProvider),
 		controllersinstancetype.NewController(instanceTypeProvider),
 		controllersinstancetypecapacity.NewController(kubeClient, cloudProvider, instanceTypeProvider),
+		nodeclassinplaceupdate.NewController(kubeClient, cloudProvider, nodeProvider),
 		status.NewController[*v1alpha1.LinodeNodeClass](kubeClient, mgr.GetEventRecorderFor("karpenter"), status.EmitDeprecatedMetrics),
 		metrics.NewController(kubeClient, cloudProvider),
 	}
+	return controllers
 }

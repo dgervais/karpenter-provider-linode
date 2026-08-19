@@ -20,13 +20,15 @@ import (
 	"strings"
 	"time"
 
+	"github.com/linode/linodego/v2"
 	"github.com/mitchellh/hashstructure/v2"
-	"github.com/patrickmn/go-cache"
+	gocache "github.com/patrickmn/go-cache"
 	"github.com/samber/lo"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
+	"sigs.k8s.io/karpenter/pkg/events"
 
 	"github.com/linode/karpenter-provider-linode/pkg/apis/v1alpha1"
 	sdk "github.com/linode/karpenter-provider-linode/pkg/linode"
@@ -36,33 +38,50 @@ import (
 )
 
 const (
-	requeueAfterTime                    = 10 * time.Minute
-	ConditionReasonDependenciesNotReady = "DependenciesNotReady"
-	ConditionReasonTagValidationFailed  = "TagValidationFailed"
+	requeueAfterTime = 10 * time.Minute
+	// Requeue invalid lkeK8sVersion checks quickly so readiness flips soon after an
+	// external LKE control plane upgrade becomes visible in the Linode API.
+	lkeVersionRequeueAfterTime = time.Minute
 )
 
-var ValidationConditionMessages = map[string]string{}
+const (
+	ConditionReasonTagValidationFailed               = "TagValidationFailed"
+	ConditionReasonLKEK8sVersionUnsupported          = "LKEK8sVersionUnsupported"
+	ConditionReasonLKEK8sVersionControlPlaneMismatch = "LKEK8sVersionControlPlaneMismatch"
+)
+
+var ValidationConditionMessages = map[string]string{
+	ConditionReasonTagValidationFailed:               "LinodeNodeClass spec.tags contains restricted provider-managed tags",
+	ConditionReasonLKEK8sVersionUnsupported:          "lkeK8sVersion is only supported for LKE Enterprise clusters",
+	ConditionReasonLKEK8sVersionControlPlaneMismatch: "lkeK8sVersion requires the LKE cluster control plane to already be on the same version",
+}
 
 type Validation struct {
 	kubeClient           client.Client
 	cloudProvider        cloudprovider.CloudProvider
+	recorder             events.Recorder
+	clusterID            int
 	linodeClient         sdk.LinodeAPI
 	instanceTypeProvider instancetype.Provider
-	cache                *cache.Cache
+	cache                *gocache.Cache
 	dryRunDisabled       bool
 }
 
 func NewValidationReconciler(
 	kubeClient client.Client,
 	cloudProvider cloudprovider.CloudProvider,
+	recorder events.Recorder,
+	clusterID int,
 	linodeClient sdk.LinodeAPI,
 	instanceTypeProvider instancetype.Provider,
-	cache *cache.Cache,
+	cache *gocache.Cache,
 	dryRunDisabled bool,
 ) *Validation {
 	return &Validation{
 		kubeClient:           kubeClient,
 		cloudProvider:        cloudProvider,
+		recorder:             recorder,
+		clusterID:            clusterID,
 		linodeClient:         linodeClient,
 		instanceTypeProvider: instanceTypeProvider,
 		cache:                cache,
@@ -70,32 +89,7 @@ func NewValidationReconciler(
 	}
 }
 
-// nolint:gocyclo
 func (v *Validation) Reconcile(ctx context.Context, nodeClass *v1alpha1.LinodeNodeClass) (reconcile.Result, error) {
-	if _, ok := lo.Find(v.requiredConditions(), func(cond string) bool {
-		return nodeClass.StatusConditions().Get(cond).IsFalse()
-	}); ok {
-		// If any of the required status conditions are false, we know validation will fail regardless of the other values.
-		nodeClass.StatusConditions().SetFalse(
-			v1.ConditionTypeValidationSucceeded,
-			ConditionReasonDependenciesNotReady,
-			"required status conditions are not satisfied",
-		)
-		return reconcile.Result{RequeueAfter: requeueAfterTime}, nil
-	}
-	if _, ok := lo.Find(v.requiredConditions(), func(cond string) bool {
-		return nodeClass.StatusConditions().Get(cond).IsUnknown()
-	}); ok {
-		// If none of the status conditions are false, but at least one is unknown, we should also consider the validation
-		// state to be unknown. Once all required conditions collapse to a true or false state, we can test validation.
-		nodeClass.StatusConditions().SetUnknownWithReason(
-			v1.ConditionTypeValidationSucceeded,
-			ConditionReasonDependenciesNotReady,
-			"required status conditions are not satisfied",
-		)
-		return reconcile.Result{RequeueAfter: requeueAfterTime}, nil
-	}
-
 	nodeClaim := &v1.NodeClaim{
 		Spec: v1.NodeClaimSpec{
 			NodeClassRef: &v1.NodeClassReference{
@@ -110,6 +104,13 @@ func (v *Validation) Reconcile(ctx context.Context, nodeClass *v1alpha1.LinodeNo
 		tags = utils.GetTagsForLKE(nodeClass, nodeClaim, options.FromContext(ctx).ClusterName)
 	} else {
 		tags = utils.GetTags(nodeClass, nodeClaim, options.FromContext(ctx).ClusterName)
+	}
+
+	if res, err := v.validateLKEK8sVersion(ctx, nodeClass); err != nil || !lo.IsEmpty(res) {
+		return res, err
+	}
+	if err := v.validateTags(nodeClass); err != nil {
+		return reconcile.Result{}, err
 	}
 
 	if val, ok := v.cache.Get(v.cacheKey(nodeClass, tags)); ok {
@@ -137,17 +138,44 @@ func (v *Validation) Reconcile(ctx context.Context, nodeClass *v1alpha1.LinodeNo
 	return reconcile.Result{RequeueAfter: requeueAfterTime}, nil
 }
 
-/* func (v *Validation) updateCacheOnFailure(nodeClass *v1.LinodeNodeClass, tags map[string]string, failureReason string) {
-	v.cache.SetDefault(v.cacheKey(nodeClass, tags), failureReason)
-	nodeClass.StatusConditions().SetFalse(
-		v1.ConditionTypeValidationSucceeded,
-		failureReason,
-		ValidationConditionMessages[failureReason],
-	)
-} */
+func (v *Validation) validateTags(nodeClass *v1alpha1.LinodeNodeClass) error {
+	if err := utils.ValidateTags(nodeClass.Spec.Tags); err != nil {
+		nodeClass.StatusConditions().SetFalse(v1.ConditionTypeValidationSucceeded, ConditionReasonTagValidationFailed, err.Error())
+		return reconcile.TerminalError(fmt.Errorf("validating tags, %w", err))
+	}
+	return nil
+}
 
-func (*Validation) requiredConditions() []string {
-	return []string{}
+func (v *Validation) validateLKEK8sVersion(ctx context.Context, nodeClass *v1alpha1.LinodeNodeClass) (reconcile.Result, error) {
+	if options.FromContext(ctx).Mode != "lke" || nodeClass.Spec.LKEK8sVersion == nil {
+		return reconcile.Result{}, nil
+	}
+	if v.clusterID == 0 {
+		return reconcile.Result{}, fmt.Errorf("validating lkeK8sVersion, LKE cluster ID is not configured")
+	}
+
+	cluster, err := v.linodeClient.GetLKECluster(ctx, v.clusterID)
+	if err != nil {
+		return reconcile.Result{}, fmt.Errorf("getting LKE cluster %d: %w", v.clusterID, err)
+	}
+
+	desiredVersion := *nodeClass.Spec.LKEK8sVersion
+	switch linodego.LKEVersionTier(cluster.Tier) {
+	case linodego.LKEVersionEnterprise:
+		if cluster.K8sVersion == desiredVersion {
+			return reconcile.Result{}, nil
+		}
+		message := fmt.Sprintf("lkeK8sVersion %q requires the LKE cluster control plane to already be on %q, current cluster version is %q", desiredVersion, desiredVersion, cluster.K8sVersion)
+		nodeClass.StatusConditions().SetFalse(v1alpha1.ConditionTypeValidationSucceeded, ConditionReasonLKEK8sVersionControlPlaneMismatch, message)
+		v.recorder.Publish(LKEK8sVersionValidationFailedEvent(nodeClass, ConditionReasonLKEK8sVersionControlPlaneMismatch, message))
+		return reconcile.Result{RequeueAfter: lkeVersionRequeueAfterTime}, nil
+	case linodego.LKEVersionStandard:
+		message := "lkeK8sVersion is only supported for LKE Enterprise clusters"
+		nodeClass.StatusConditions().SetFalse(v1alpha1.ConditionTypeValidationSucceeded, ConditionReasonLKEK8sVersionUnsupported, message)
+		v.recorder.Publish(LKEK8sVersionValidationFailedEvent(nodeClass, ConditionReasonLKEK8sVersionUnsupported, message))
+		return reconcile.Result{RequeueAfter: lkeVersionRequeueAfterTime}, nil
+	}
+	return reconcile.Result{}, fmt.Errorf("validating lkeK8sVersion, unsupported LKE version tier %q", cluster.Tier)
 }
 
 func (*Validation) cacheKey(nodeClass *v1alpha1.LinodeNodeClass, tags map[string]string) string {
@@ -176,35 +204,3 @@ func (v *Validation) clearCacheEntries(nodeClass *v1alpha1.LinodeNodeClass) {
 		v.cache.Delete(key)
 	}
 }
-
-// getInstanceTypesForNodeClass returns the set of instances which could be launched using this NodeClass based on the
-// requirements of linked NodePools.
-/* func (v *Validation) getInstanceTypesForNodeClass(ctx context.Context, nodeClass *v1.LinodeNodeClass) ([]*cloudprovider.InstanceType, error) {
-	instanceTypes, err := v.instanceTypeProvider.List(ctx, nodeClass)
-	if err != nil {
-		return nil, fmt.Errorf("listing instance types for nodeclass, %w", err)
-	}
-	nodePools, err := nodepoolutils.ListManaged(ctx, v.kubeClient, v.cloudProvider, nodepoolutils.ForNodeClass(nodeClass))
-	if err != nil {
-		return nil, fmt.Errorf("listing nodepools for nodeclass, %w", err)
-	}
-	var compatibleInstanceTypes []*cloudprovider.InstanceType
-	names := sets.New[string]()
-	for _, np := range nodePools {
-		reqs := scheduling.NewNodeSelectorRequirementsWithMinValues(np.Spec.Template.Spec.Requirements...)
-		if np.Spec.Template.Labels != nil {
-			reqs.Add(lo.Values(scheduling.NewLabelRequirements(np.Spec.Template.Labels))...)
-		}
-		for _, it := range instanceTypes {
-			if it.Requirements.Intersects(reqs) != nil {
-				continue
-			}
-			if names.Has(it.Name) {
-				continue
-			}
-			names.Insert(it.Name)
-			compatibleInstanceTypes = append(compatibleInstanceTypes, it)
-		}
-	}
-	return compatibleInstanceTypes, nil
-} */

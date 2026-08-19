@@ -20,7 +20,6 @@ package v1alpha1
 
 import (
 	"github.com/awslabs/operatorpkg/status"
-	"github.com/linode/linodego"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1"
 	runtime "k8s.io/apimachinery/pkg/runtime"
@@ -441,13 +440,6 @@ func (in *LinodeNodeClassSpec) DeepCopyInto(out *LinodeNodeClassSpec) {
 		*out = make([]string, len(*in))
 		copy(*out, *in)
 	}
-	if in.Labels != nil {
-		in, out := &in.Labels, &out.Labels
-		*out = make(linodego.LKENodePoolLabels, len(*in))
-		for key, val := range *in {
-			(*out)[key] = val
-		}
-	}
 	if in.FirewallID != nil {
 		in, out := &in.FirewallID, &out.FirewallID
 		*out = new(int)
@@ -496,11 +488,6 @@ func (in *LinodeNodeClassSpec) DeepCopyInto(out *LinodeNodeClassSpec) {
 	if in.LKEK8sVersion != nil {
 		in, out := &in.LKEK8sVersion, &out.LKEK8sVersion
 		*out = new(string)
-		**out = **in
-	}
-	if in.LKEUpdateStrategy != nil {
-		in, out := &in.LKEUpdateStrategy, &out.LKEUpdateStrategy
-		*out = new(linodego.LKENodePoolUpdateStrategy)
 		**out = **in
 	}
 }

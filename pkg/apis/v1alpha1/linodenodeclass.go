@@ -18,7 +18,7 @@ import (
 	"fmt"
 
 	"github.com/awslabs/operatorpkg/status"
-	"github.com/linode/linodego"
+	"github.com/linode/linodego/v2"
 	"github.com/mitchellh/hashstructure/v2"
 	"github.com/samber/lo"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -50,10 +50,6 @@ type LinodeNodeClassSpec struct {
 	// +optional
 	// +listType=set
 	Tags []string `json:"tags,omitempty"`
-
-	// labels is a map of Kubernetes node labels to apply to the Node.
-	// +optional
-	Labels linodego.LKENodePoolLabels `json:"labels,omitempty"`
 
 	// firewallID is the id of the cloud firewall to apply to the Linode Instance.
 	// +optional
@@ -105,15 +101,11 @@ type LinodeNodeClassSpec struct {
 
 	// lkeK8sVersion is the Kubernetes version for LKE node pools.
 	// Only used in LKE mode. Only available for Enterprise LKE clusters.
+	// The LKE cluster control plane version must already be upgraded to this version
+	// before setting this field. Otherwise pool reconciliation fails and replacement
+	// NodeClaims won't become ready on the requested worker version.
 	// +optional
 	LKEK8sVersion *string `json:"lkeK8sVersion,omitempty"`
-
-	// lkeUpdateStrategy defines how nodes are updated when the LKE node pool is modified.
-	// Only used in LKE mode.
-	// Valid values are "rolling_update" and "on_recycle".
-	// +optional
-	// +kubebuilder:validation:Enum=rolling_update;on_recycle
-	LKEUpdateStrategy *linodego.LKENodePoolUpdateStrategy `json:"lkeUpdateStrategy,omitempty"`
 }
 
 type InstanceCreatePlacementGroupOptions struct {
@@ -512,9 +504,13 @@ type LinodeNodeClass struct {
 // 3. A field is removed from the hash calculations
 const LinodeNodeClassHashVersion = "v1alpha1"
 
+// Hash generates a hash of the LinodeNodeClass spec and annotations, excluding fields that can we update in-place (e.g. tags).
+// This is used to determine if a NodeClaim needs to be replaced due to changes in the NodeClass.
 func (in *LinodeNodeClass) Hash() string {
+	hashableSpec := in.Spec
+	hashableSpec.Tags = nil // Tags are not part of the hash calculation since we do in-place updates for it
 	return fmt.Sprint(lo.Must(hashstructure.Hash([]interface{}{
-		in.Spec,
+		hashableSpec,
 	}, hashstructure.FormatV2, &hashstructure.HashOptions{
 		SlicesAsSets:    true,
 		IgnoreZeroValue: true,
@@ -535,7 +531,9 @@ func (in *LinodeNodeClass) SetConditions(conditions []status.Condition) {
 }
 
 func (in *LinodeNodeClass) StatusConditions() status.ConditionSet {
-	conds := []string{}
+	conds := []string{
+		ConditionTypeValidationSucceeded,
+	}
 	return status.NewReadyConditions(conds...).For(in)
 }
 

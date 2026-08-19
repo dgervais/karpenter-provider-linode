@@ -15,6 +15,20 @@ This guide details the configuration options for the Karpenter Provider for Lino
 | `VM_MEMORY_OVERHEAD_PERCENT`| Additional memory overhead to simplify calculation (0.075 = 7.5%). | No | `0.075` |
 | `DISABLE_DRY_RUN` | Set to `true` to disable dry-run validation for LinodeNodeClasses. | No | `false` |
 
+These environment variables are injected into the controller pod via a Kubernetes Secret. By default, the Helm chart creates a secret called `karpl-credentials` from the `apiToken`, `apiURL`, `apiVersion`, and `region` values.
+
+> **Note: Using an external secret (GitOps)**
+>
+> For GitOps workflows where credentials should not be stored in Helm values, you can set `credentialsSecretRef` to point to a pre-existing Secret instead. When set, the chart skips creating its own secret and uses the referenced one. This is useful when secrets are managed externally via ExternalSecrets, SealedSecrets, Vault, or similar tools.
+>
+> The externally managed secret must contain the following keys: `LINODE_TOKEN`, `LINODE_URL`, `LINODE_API_VERSION`, and optionally `CLUSTER_REGION`.
+>
+> ```bash
+> helm upgrade --install karpenter charts/karpenter \
+>     --set settings.clusterName=my-cluster \
+>     --set credentialsSecretRef=my-linode-credentials
+> ```
+
 ## Modes
 
 The provider can operate in two distinct modes, controlled by the `KARPENTER_MODE` environment variable.
@@ -42,11 +56,9 @@ The `LinodeNodeClass` allows you to configure specific settings for the nodes ma
 
 | Field | Type | Supported Modes | Description |
 |-------|------|-----------------|-------------|
-| `tags` | `[]string` | **All** | List of tags to apply to the Instance or Node Pool. |
+| `tags` | `[]string` | **All** | List of tags to apply to instances. In LKE mode, Karpenter-managed pools keep only core provider tags. |
 | `firewallID` | `int` | **All** | The ID of the Cloud Firewall to attach. |
-| `labels` | `map[string]string`| **LKE** | Labels to apply specifically to the **LKE Node Pool** infrastructure. |
-| `lkeK8sVersion` | `string` | **LKE** | Specific Kubernetes version for the node (e.g., "1.29"). This is only available for LKE-E |
-| `lkeUpdateStrategy` | `string` | **LKE** | Strategy for pool updates: `rolling_update` or `on_recycle`. This is only available for LKE-E |
+| `lkeK8sVersion` | `string` | **LKE** | Specific Kubernetes version for LKE Enterprise worker nodes. Upgrade the cluster control plane to this version first; otherwise reconciliation fails and replacement NodeClaims will not come up on the requested version. For Enterprise clusters, the update strategy automatically defaults to `on_recycle`. |
 | `image` | `string` | **Instance** | The Image ID to deploy (default: `linode/ubuntu22.04`). |
 | `authorizedKeys` | `[]string` | **Instance** | SSH Public Keys to add to the `root` user. |
 | `authorizedUsers` | `[]string` | **Instance** | List of Linode usernames whose SSH keys will be added. |
@@ -62,7 +74,7 @@ It is important to distinguish between Karpenter configuration and Linode-specif
 *   **Taints**: Taints are defined in the **Karpenter `NodePool`** resource (`spec.template.spec.taints`), *not* in the `LinodeNodeClass`.
     *   **LKE Mode**: Taints are passed to the LKE Node Pool configuration and applied to nodes by LKE.
 *   **Kubernetes Labels**: Standard scheduling labels are defined in the **Karpenter `NodePool`** (`spec.template.metadata.labels`). Karpenter ensures these are applied to the Node object.
-*   **LKE Labels**: The `labels` field in `LinodeNodeClass` is specific to **LKE Node Pools** infrastructure. While they often propagate to Kubernetes nodes via the CCM, this field is intended for LKE-level organization.
+*   **LKE Labels**: LKE Node Pool labels are derived from the labels resolved onto the NodeClaim (originating from NodePool template metadata labels).
 
 ### Example: LKE Mode
 

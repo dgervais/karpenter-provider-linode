@@ -21,6 +21,7 @@ import (
 	"github.com/patrickmn/go-cache"
 	"github.com/samber/lo"
 	clock "k8s.io/utils/clock/testing"
+	"k8s.io/utils/ptr"
 	crmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 	"sigs.k8s.io/karpenter/pkg/controllers/nodeoverlay"
 	coretest "sigs.k8s.io/karpenter/pkg/test"
@@ -74,9 +75,6 @@ func (env *Environment) NodeProvider(ctx context.Context) instance.Provider {
 
 func NewEnvironment(ctx context.Context) *Environment {
 	// Mock
-	clock := &clock.FakeClock{}
-	store := nodeoverlay.NewInstanceTypeStore()
-
 	linodeClient := fake.NewLinodeClient()
 
 	// cache
@@ -125,9 +123,9 @@ func NewEnvironment(ctx context.Context) *Environment {
 	)
 
 	return &Environment{
-		Clock:             clock,
+		Clock:             &clock.FakeClock{},
 		EventRecorder:     eventRecorder,
-		InstanceTypeStore: store,
+		InstanceTypeStore: nodeoverlay.NewInstanceTypeStore(),
 
 		LinodeAPI: linodeClient,
 
@@ -149,6 +147,7 @@ func (env *Environment) Reset() {
 	env.Clock.SetTime(time.Time{})
 
 	env.LinodeAPI.Reset()
+	env.EventRecorder.Reset()
 
 	env.LinodeCache.Flush()
 	env.InstanceCache.Flush()
@@ -169,4 +168,10 @@ func (env *Environment) Reset() {
 			}
 		}
 	}
+}
+
+func (env *Environment) SetDefaults() {
+	instances := fake.MakeInstances()
+	env.LinodeAPI.ListTypesOutput.Set(ptr.To(instances))
+	env.LinodeAPI.GetRegionAvailabilityOutput.Set(ptr.To(fake.MakeInstanceOfferings(instances)))
 }

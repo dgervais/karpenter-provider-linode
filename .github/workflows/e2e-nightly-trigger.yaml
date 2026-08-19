@@ -1,0 +1,98 @@
+name: e2e-nightly-trigger
+
+on:
+  schedule:
+    - cron: '0 0 * * *'
+
+permissions:
+  contents: read
+  pull-requests: read
+  actions: read
+  id-token: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  e2e-nightly-standard:
+    name: Nightly E2E (standard)
+    uses: ./.github/workflows/e2e.yaml
+    with:
+      cluster_name: ${{ format('kns-{0}', github.run_id) }}
+      cluster_tier: standard
+      chainsaw_selector: all
+      cleanup: true
+      timeout_minutes: 90
+      cleanup_timeout_minutes: 20
+      harden_runner_egress_policy: block
+      harden_runner_allowed_endpoints: >-
+        *.linodelke.net:443
+        api.github.com:443
+        api.linode.com:443
+        api.segment.io:443
+        auth.docker.io:443
+        identity.docker.com:443
+        files.pythonhosted.org:443
+        gcr.io:443
+        github.com:443
+        index.docker.io:443
+        ipv4.icanhazip.com:443
+        linode.github.io:443
+        pypi.org:443
+        registry-1.docker.io:443
+        release-assets.githubusercontent.com:443
+        *.githubusercontent.com:443
+        cdn.dl.k8s.io:443
+        dl.google.com:443
+        dl.k8s.io:443
+        get.helm.sh:443
+        mise-versions.jdx.dev:443
+        mise.jdx.dev:443
+        proxy.golang.org:443
+        storage.googleapis.com:443
+        sum.golang.org:443
+        tuf-repo-cdn.sigstore.dev:443
+    secrets: inherit
+
+  e2e-nightly-enterprise:
+    name: Nightly E2E (enterprise)
+    uses: ./.github/workflows/e2e.yaml
+    with:
+      cluster_name: ${{ format('kne-{0}', github.run_id) }}
+      cluster_tier: enterprise
+      chainsaw_selector: all
+      cleanup: true
+      timeout_minutes: 90
+      cleanup_timeout_minutes: 20
+      harden_runner_egress_policy: block
+      harden_runner_allowed_endpoints: >-
+        *.linodelke.net:443
+        *.enterprise.linodelke.net:6443
+        api.github.com:443
+        api.linode.com:443
+        api.segment.io:443
+        auth.docker.io:443
+        identity.docker.com:443
+        cloud.tilt.dev:443
+        files.pythonhosted.org:443
+        gcr.io:443
+        github.com:443
+        index.docker.io:443
+        ipv4.icanhazip.com:443
+        linode.github.io:443
+        pypi.org:443
+        registry-1.docker.io:443
+        release-assets.githubusercontent.com:443
+        cdn.dl.k8s.io:443
+        *.githubusercontent.com:443
+        dl.google.com:443
+        dl.k8s.io:443
+        get.helm.sh:443
+        mise-versions.jdx.dev:443
+        mise.jdx.dev:443
+        proxy.golang.org:443
+        storage.googleapis.com:443
+        sum.golang.org:443
+        tuf-repo-cdn.sigstore.dev:443
+    secrets: inherit

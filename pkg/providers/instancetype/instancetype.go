@@ -19,7 +19,7 @@ import (
 	"fmt"
 	"sync"
 
-	"github.com/linode/linodego"
+	"github.com/linode/linodego/v2"
 	"github.com/mitchellh/hashstructure/v2"
 	"github.com/patrickmn/go-cache"
 	"github.com/samber/lo"
@@ -54,7 +54,7 @@ type Provider interface {
 }
 
 type DefaultProvider struct {
-	client                sdk.LinodeAPI
+	linodeAPI             sdk.LinodeAPI
 	instanceTypesResolver Resolver
 
 	muInstanceTypesInfo sync.RWMutex
@@ -72,7 +72,7 @@ type DefaultProvider struct {
 }
 
 func NewDefaultProvider(
-	client sdk.LinodeAPI,
+	linodeAPI sdk.LinodeAPI,
 	instanceTypesResolver Resolver,
 	instanceTypesCache *cache.Cache,
 	offeringCache *cache.Cache,
@@ -83,7 +83,7 @@ func NewDefaultProvider(
 	// fetching InstanceTypes which includes pricing info.
 ) *DefaultProvider {
 	return &DefaultProvider{
-		client:                  client,
+		linodeAPI:               linodeAPI,
 		instanceTypesInfo:       map[string]linodego.LinodeType{},
 		instanceTypesOfferings:  map[string]sets.Set[string]{},
 		instanceTypesResolver:   instanceTypesResolver,
@@ -91,7 +91,7 @@ func NewDefaultProvider(
 		discoveredCapacityCache: discoveredCapacityCache,
 		cm:                      pretty.NewChangeMonitor(),
 		offeringProvider: offering.NewDefaultProvider(
-			client,
+			linodeAPI,
 			unavailableOfferingsCache,
 			offeringCache,
 		),
@@ -171,7 +171,7 @@ func (p *DefaultProvider) get(ctx context.Context, nodeClass NodeClass, name str
 	if !ok {
 		return nil, fmt.Errorf("instance type %s not found in cache", name)
 	}
-	it := p.instanceTypesResolver.Resolve(ctx, info, nodeClass)
+	it := p.instanceTypesResolver.Resolve(ctx, &info, nodeClass)
 	if it == nil {
 		return nil, fmt.Errorf("failed to generate instance type %s", name)
 	}
@@ -207,7 +207,7 @@ func (p *DefaultProvider) UpdateInstanceTypes(ctx context.Context) error {
 	// There's no clean way to filter instance types by region client-side either
 	// since we'd need to assume if an instance type doesn't have a region price,
 	// then it's not available in that region.
-	instanceTypes, err := p.client.ListTypes(ctx, &linodego.ListOptions{PageSize: maxPageSize})
+	instanceTypes, err := p.linodeAPI.ListTypes(ctx, &linodego.ListOptions{PageSize: maxPageSize})
 	if err != nil {
 		return fmt.Errorf("listing linode instance types, %w", err)
 	}
@@ -233,27 +233,18 @@ func (p *DefaultProvider) UpdateInstanceTypeOfferings(ctx context.Context) error
 	p.muInstanceTypesOfferings.Lock()
 	defer p.muInstanceTypesOfferings.Unlock()
 
-	filter := linodego.Filter{}
-	filter.AddField(linodego.Contains, "region", options.FromContext(ctx).ClusterRegion)
-	filterJSON, err := filter.MarshalJSON()
+	regionAvail, err := p.linodeAPI.GetRegionAvailability(ctx, options.FromContext(ctx).ClusterRegion)
 	if err != nil {
-		return fmt.Errorf("failed to marshal filter: %w", err)
-	}
-	regionAvail, err := p.client.ListRegionsAvailability(ctx, &linodego.ListOptions{
-		PageSize: maxPageSize,
-		Filter:   string(filterJSON),
-	})
-	if err != nil {
-		return fmt.Errorf("listing region availability %w", err)
+		return fmt.Errorf("getting region availability %w", err)
 	}
 
 	instanceTypeOfferings := map[string]sets.Set[string]{}
-	for _, offering := range regionAvail {
-		if _, ok := instanceTypeOfferings[offering.Plan]; !ok {
-			instanceTypeOfferings[offering.Plan] = sets.New[string]()
+	for _, off := range regionAvail {
+		if _, ok := instanceTypeOfferings[off.Plan]; !ok {
+			instanceTypeOfferings[off.Plan] = sets.New[string]()
 		}
-		if offering.Available {
-			instanceTypeOfferings[offering.Plan].Insert(offering.Region)
+		if off.Available {
+			instanceTypeOfferings[off.Plan].Insert(off.Region)
 		}
 	}
 

@@ -1,0 +1,132 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/kyverno/chainsaw/main/.schemas/json/test-chainsaw-v1alpha1.json
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  creationTimestamp: null
+  name: scheduling-nodepool-label-selector
+  labels:
+    all:
+    category.scheduling:
+spec:
+  steps:
+    - name: Make sure there are no lingering NodeClaims
+      try:
+      - script:
+          content: kubectl get nodeclaim -o json
+          check:
+            ($error): ~
+            (json_parse($stdout).items | length(@)): 0
+
+    - name: Create dedicated labeled NodePool
+      try:
+      - apply:
+          file: nodepool-selector.yaml
+
+    - name: Create inflate deployment constrained to selector NodePool
+      try:
+      - apply:
+          file: inflate-selector.yaml
+      catch:
+      - script:
+          content: kubectl get events -A --sort-by=.lastTimestamp | tail -n 50
+
+    - name: Wait for initial scheduling
+      try:
+      - assert:
+          timeout: 10m
+          resource:
+            apiVersion: apps/v1
+            kind: Deployment
+            metadata:
+              name: inflate
+              namespace: default
+            status:
+              replicas: 1
+              availableReplicas: 1
+      catch:
+      - describe:
+          apiVersion: karpenter.sh/v1
+          kind: NodeClaim
+      - script:
+          content: kubectl get events -A --sort-by=.lastTimestamp | tail -n 50
+      - podLogs:
+          namespace: kube-system
+          selector: app.kubernetes.io/name=karpenter
+          tail: 100
+
+    - name: Wait for NodeClaim with the correct plan to be ready
+      try:
+      - assert:
+          timeout: 10m
+          resource:
+            apiVersion: karpenter.sh/v1
+            kind: NodeClaim
+            metadata:
+              labels:
+                node.kubernetes.io/instance-type: g6-standard-2
+            status:
+              (conditions[?type == 'Ready']):
+              - status: 'True'
+      catch:
+      - describe:
+          apiVersion: karpenter.sh/v1
+          kind: NodeClaim
+      - script:
+          content: kubectl -n default get events --sort-by=.metadata.creationTimestamp | tail -n 50
+      - podLogs:
+          namespace: kube-system
+          selector: app.kubernetes.io/name=karpenter
+          tail: 100
+
+    - name: Assert selector-constrained inflate workload is running on expected node label
+      try:
+      - script:
+          shell: bash
+          shellArgs:
+            - -c
+          content: |
+            set -euo pipefail
+            node_name=$(kubectl -n default get pod -l app=inflate -o jsonpath='{.items[0].spec.nodeName}')
+            selector_label=$(kubectl get node "$node_name" -o jsonpath='{.metadata.labels.e2e\.linode\.dev/selector}')
+            inflate_phase=$(kubectl -n default get pod -l app=inflate -o jsonpath='{.items[0].status.phase}')
+            [ "$selector_label" = "true" ]
+            [ "$inflate_phase" = "Running" ]
+      catch:
+      - script:
+          content: |
+            kubectl -n default describe deployment inflate
+            kubectl -n default get pod -l app=inflate -o wide
+            kubectl get node -o wide
+            kubectl get nodeclaim -A -o wide
+            kubectl get nodepool selector -o yaml
+            kubectl get events -A --sort-by=.lastTimestamp | tail -n 50
+      - podLogs:
+          namespace: kube-system
+          selector: app.kubernetes.io/name=karpenter
+          tail: 100
+
+    - name: Scale deployment to zero
+      try:
+      - script:
+          content: |
+            kubectl scale -n default deployment inflate --replicas 0
+
+    - name: Wait for NodeClaims to be deleted
+      try:
+      - wait:
+          apiVersion: karpenter.sh/v1
+          kind: NodeClaim
+          timeout: 10m
+          selector: karpenter.sh/nodepool=selector
+          for:
+            deletion: {}
+      catch:
+      - describe:
+          apiVersion: karpenter.sh/v1
+          kind: NodeClaim
+      - script:
+          content: kubectl get events -A --sort-by=.lastTimestamp | tail -n 50
+      - podLogs:
+          namespace: kube-system
+          selector: app.kubernetes.io/name=karpenter
+          tail: 100

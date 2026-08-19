@@ -1,115 +1,155 @@
 name: e2e
 
 on:
-  workflow_dispatch:
-  pull_request: # TODO: change this to pull_request_target so people don't need to set their own LINODE_TOKEN secret in their forks
-    types: [opened, reopened, synchronize, closed]
-    branches:
-      - '**'
+  workflow_call:
+    inputs:
+      environment:
+        required: false
+        type: string
+        default: ''
+      cluster_name:
+        type: string
+        required: true
+      cluster_tier:
+        type: string
+        required: false
+        default: standard
+      chainsaw_selector:
+        type: string
+        required: true
+      cleanup:
+        type: boolean
+        required: true
+      timeout_minutes:
+        type: number
+        required: false
+        default: 60
+      cleanup_timeout_minutes:
+        type: number
+        required: false
+        default: 20
+      chainsaw_flags:
+        type: string
+        required: false
+        default: --config .chainsaw.yaml
+      harden_runner_egress_policy:
+        type: string
+        required: true
+      harden_runner_allowed_endpoints:
+        type: string
+        required: true
+
+env:
+  E2E_STANDARD_CLEANUP_ALLOWED_ENDPOINTS: >-
+    api.github.com:443
+    api.linode.com:443
+    api.segment.io:443
+    files.pythonhosted.org:443
+    github.com:443
+    pypi.org:443
+    release-assets.githubusercontent.com:443
+    proxy.golang.org:443
+    cdn.dl.k8s.io:443
+    dl.google.com:443
+    dl.k8s.io:443
+    get.helm.sh:443
+    mise-versions.jdx.dev:443
+    mise.jdx.dev:443
+    storage.googleapis.com:443
+    sum.golang.org:443
+    tuf-repo-cdn.sigstore.dev:443
+    *.blob.core.windows.net:443
+    *.githubusercontent.com:443
+  E2E_ENTERPRISE_CLEANUP_ALLOWED_ENDPOINTS: >-
+    api.github.com:443
+    api.linode.com:443
+    api.segment.io:443
+    cloud.tilt.dev:443
+    files.pythonhosted.org:443
+    github.com:443
+    pypi.org:443
+    release-assets.githubusercontent.com:443
+    proxy.golang.org:443
+    dl.k8s.io:443
+    dl.google.com:443
+    storage.googleapis.com:443
+    cdn.dl.k8s.io:443
+    sum.golang.org:443
+    get.helm.sh:443
+    mise-versions.jdx.dev:443
+    mise.jdx.dev:443
+    tuf-repo-cdn.sigstore.dev:443
+    *.blob.core.windows.net:443
+    *.githubusercontent.com:443
 
 permissions:
   contents: read
   pull-requests: read
   actions: read
-
-concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  id-token: write
 
 jobs:
-  changes:
-    runs-on: ubuntu-latest
-    outputs:
-      # Expose matched filters as job 'src' output variable
-      paths: ${{ steps.filter.outputs.changes }}
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          ref: ${{ github.event.pull_request.head.sha }}
-      - name: Harden Runner
-        uses: step-security/harden-runner@v2
-        with:
-          disable-sudo: true
-          egress-policy: block
-          allowed-endpoints: >
-            api.github.com:443
-            github.com:443
-      - uses: dorny/paths-filter@v3
-        id: filter
-        with:
-          filters: .github/filters.yml
-
   e2e:
-    needs: changes
-    if: (github.event.action != 'closed' && contains(fromJSON(needs.changes.outputs.paths), 'src')) || github.event_name == 'workflow_dispatch'
+    name: E2E (${{ inputs.cluster_tier }})
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: ${{ inputs.timeout_minutes }}
+    environment: ${{ inputs.environment }}
     env:
       LINODE_TOKEN: ${{ secrets.LINODE_TOKEN }}
       LINODE_CLI_TOKEN: ${{ secrets.LINODE_TOKEN }}
       LINODE_REGION: us-sea
-      CLUSTER_NAME: karpl-${{ github.event.pull_request.number && format('pr-{0}', github.event.pull_request.number) || format('manual-{0}', github.run_id) }}
-      KUBECONFIG: ${{ github.event.pull_request.number && format('pr-{0}-kubeconfig', github.event.pull_request.number) || format('manual-{0}-kubeconfig', github.run_id) }}
+      CLUSTER_NAME: ${{ inputs.cluster_name }}
+      CLUSTER_TIER: ${{ inputs.cluster_tier }}
+      CHAINSAW_SELECTOR: ${{ inputs.chainsaw_selector }}
+      CHAINSAW_FLAGS: ${{ inputs.chainsaw_flags }}
 
     steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@b09bb98e06d4d774595224525879c09bc6e98c40 # v2.20.1
+        with:
+          egress-policy: ${{ inputs.harden_runner_egress_policy }}
+          allowed-endpoints: ${{ inputs.harden_runner_allowed_endpoints }}
+
       - name: Checkout code
-        uses: actions/checkout@v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
+          persist-credentials: false
 
-      - name: Login to Docker Hub
-        uses: docker/login-action@v3
+      - name: E2E setup and test
+        uses: ./.github/actions/e2e
+        env:
+          DOCKERHUB_OIDC_CONNECTIONID: ${{ secrets.DOCKERHUB_OIDC_CONNECTIONID }}
         with:
-          username: ${{ secrets.DOCKER_USERNAME }}
-          password: ${{ secrets.DOCKER_PASSWORD }}
-
-      - name: Setup Go
-        uses: actions/setup-go@v6
-        with:
-          go-version-file: go.mod
-          check-latest: true
-
-      - name: Install linode-cli
-        run: pipx install linode-cli==5.65.0
-
-      - name: Install devbox
-        uses: jetify-com/devbox-install-action@v0.14.0
-        with:
-          enable-cache: 'true'
-          refresh-cli: 'false'
-
-      - name: Run E2E
-        run: |
-          devbox run setup-and-test-e2e
+          docker_username: ${{ github.repository_owner }}
+          mise_task: setup-and-test-e2e
 
   cleanup:
-    if: github.event.action == 'closed' || github.event_name == 'workflow_dispatch'
-    timeout-minutes: 20
+    name: Cleanup (${{ inputs.cluster_tier }})
+    if: ${{ inputs.cleanup && always() }}
+    needs: [e2e]
+    timeout-minutes: ${{ inputs.cleanup_timeout_minutes }}
     runs-on: ubuntu-latest
-
     env:
       LINODE_TOKEN: ${{ secrets.LINODE_TOKEN }}
       LINODE_CLI_TOKEN: ${{ secrets.LINODE_TOKEN }}
-      CLUSTER_NAME: karpl-${{ github.event.pull_request.number && format('pr-{0}', github.event.pull_request.number) || format('manual-{0}', github.run_id) }}
+      CLUSTER_NAME: ${{ inputs.cluster_name }}
+      CLUSTER_TIER: ${{ inputs.cluster_tier }}
 
     steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@b09bb98e06d4d774595224525879c09bc6e98c40 # v2.20.1
+        with:
+          egress-policy: block
+          allowed-endpoints: ${{ inputs.cluster_tier == 'enterprise' && env.E2E_ENTERPRISE_CLEANUP_ALLOWED_ENDPOINTS || env.E2E_STANDARD_CLEANUP_ALLOWED_ENDPOINTS }}
+
       - name: Checkout code
-        uses: actions/checkout@v6
-
-      - name: Setup Go
-        uses: actions/setup-go@v5
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          go-version-file: go.mod
-          check-latest: true
+          fetch-depth: 0
+          persist-credentials: false
 
-      - name: Install linode-cli
-        run: pipx install linode-cli==5.65.0
-
-      - name: Install devbox
-        uses: jetify-com/devbox-install-action@v0.14.0
+      - name: E2E Cleanup
+        uses: ./.github/actions/e2e
         with:
-          enable-cache: 'true'
-          refresh-cli: 'false'
-
-      - name: Delete LKE cluster for this PR
-        run: devbox run destroy-lke-cluster $(devbox run get-lke-cluster-id)
+          cleanup_cluster: "true"

@@ -18,7 +18,7 @@ import (
 	"fmt"
 	"sync"
 
-	"github.com/linode/linodego"
+	"github.com/linode/linodego/v2"
 	"github.com/mitchellh/hashstructure/v2"
 	"github.com/patrickmn/go-cache"
 	corev1 "k8s.io/api/core/v1"
@@ -82,7 +82,6 @@ func (p *DefaultProvider) InjectOfferings(
 	return its
 }
 
-//nolint:gocyclo
 func (p *DefaultProvider) createOfferings(
 	it *cloudprovider.InstanceType,
 	instanceTypesInfo map[string]linodego.LinodeType,

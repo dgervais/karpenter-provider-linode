@@ -18,7 +18,6 @@ import (
 	"fmt"
 
 	corev1 "k8s.io/api/core/v1"
-
 	"sigs.k8s.io/karpenter/pkg/events"
 
 	"github.com/linode/karpenter-provider-linode/pkg/apis/v1alpha1"
@@ -32,5 +31,15 @@ func WaitingOnNodeClaimTerminationEvent(nodeClass *v1alpha1.LinodeNodeClass, nam
 		Reason:         "WaitingOnNodeClaimTermination",
 		Message:        fmt.Sprintf("Waiting on NodeClaim termination for %s", utils.PrettySlice(names, 5)),
 		DedupeValues:   []string{string(nodeClass.UID)},
+	}
+}
+
+func LKEK8sVersionValidationFailedEvent(nodeClass *v1alpha1.LinodeNodeClass, reason, message string) events.Event {
+	return events.Event{
+		InvolvedObject: nodeClass,
+		Type:           corev1.EventTypeWarning,
+		Reason:         reason,
+		Message:        message,
+		DedupeValues:   []string{string(nodeClass.UID), reason},
 	}
 }

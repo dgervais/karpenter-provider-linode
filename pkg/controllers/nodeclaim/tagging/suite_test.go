@@ -21,7 +21,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/linode/linodego"
+	"github.com/linode/linodego/v2"
 	"github.com/samber/lo"
 	corev1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/tools/record"
@@ -52,6 +52,7 @@ var env *coretest.Environment
 var taggingController *tagging.Controller
 
 func TestAPIs(t *testing.T) {
+	t.Parallel()
 	ctx = TestContextWithLogger(t)
 	RegisterFailHandler(Fail)
 	RunSpecs(t, "TaggingController")
@@ -185,7 +186,7 @@ var _ = Describe("TaggingController", func() {
 				v1.LKEClusterNameTagKey + "=" + options.FromContext(ctx).ClusterName,
 			}
 			linodeInstance := lo.Must(linodeEnv.LinodeAPI.Instances.Load(linodeInstance.ID)).(linodego.Instance)
-			linodeInstanceTags := instance.NewInstance(ctx, linodeInstance).Tags
+			linodeInstanceTags := instance.NewInstance(ctx, &linodeInstance).Tags
 
 			for _, tag := range expectedTags {
 				parts := strings.Split(tag, "=")

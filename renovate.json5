@@ -1,0 +1,60 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "config:recommended",
+    "helpers:pinGitHubActionDigests",
+    "helpers:githubDigestChangelogs",
+  ], 
+  "schedule": [
+    "* 0 1,15 * *",
+  ],
+  "labels": ["dependencies"],
+  "postUpdateOptions": ["gomodTidy"],
+  "vulnerabilityAlerts": {
+    "enabled": true,
+    "groupName": "security updates",
+  },
+  "osvVulnerabilityAlerts": true,
+  "platformAutomerge": true,
+  "customManagers": [
+    {
+      "customType": "regex",
+      "managerFilePatterns": [
+        "/(^|/)Makefile$/",
+        "/(^|/)makefile$/",
+        "/(^|/)GNUMakefile$/",
+        "/\\.mk$/",
+      ],
+      "matchStrings": [
+        "# renovate: datasource=(?<datasource>[a-zA-Z0-9-._]+?) depName=(?<depName>[^\\s]+?)(?: (?:packageName)=(?<packageName>[^\\s]+?))?(?: versioning=(?<versioning>[^\\s]+?))?(?: extractVersion=(?<extractVersion>[^\\s]+?))?(?: registryUrl=(?<registryUrl>[^\\s]+?))?\\s+[A-Za-z0-9_]+?_VERSION\\s*:*\\??=\\s*[\"']?(?<currentValue>.+?)[\"']?\\s",
+      ]
+    }
+  ],
+  "packageRules": [
+    {
+      "matchCategories": ["security"],
+      "schedule": ["at any time"],
+      "prPriority": 10,
+    },
+    {
+      "matchUpdateTypes": ["minor", "patch", "pin", "digest"],
+      "automerge": true,
+    },
+    {
+      "description": "Group development toolchain bumps from mise.toml.",
+      "matchManagers": ["mise"],
+      "groupName": "mise tools",
+    },
+    {
+      "groupName": "kubernetes",
+      "groupSlug": "kubernetes-go",
+      "matchDatasources": [
+        "go",
+      ],
+      "matchPackageNames": [
+        "k8s.io/**",
+        "sigs.k8s.io/**",
+      ]
+    }
+  ]
+}

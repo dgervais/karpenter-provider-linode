@@ -61,6 +61,7 @@ func NewController(
 	cloudProvider cloudprovider.CloudProvider,
 	recorder events.Recorder,
 	region string,
+	clusterID int,
 	instanceTypeProvider instancetype.Provider,
 	linodeClient sdk.LinodeAPI,
 	validationCache *cache.Cache,
@@ -69,6 +70,8 @@ func NewController(
 	validation := NewValidationReconciler(
 		kubeClient,
 		cloudProvider,
+		recorder,
+		clusterID,
 		linodeClient,
 		instanceTypeProvider,
 		validationCache,
@@ -89,7 +92,6 @@ func (c *Controller) Name() string {
 	return "nodeclass"
 }
 
-//nolint:gocyclo
 func (c *Controller) Reconcile(ctx context.Context, nodeClass *v1alpha1.LinodeNodeClass) (reconcile.Result, error) {
 	ctx = injection.WithControllerName(ctx, c.Name())
 
@@ -103,6 +105,7 @@ func (c *Controller) Reconcile(ctx context.Context, nodeClass *v1alpha1.LinodeNo
 		// We use client.MergeFromWithOptimisticLock because patching a list with a JSON merge patch
 		// can cause races due to the fact that it fully replaces the list on a change
 		// Here, we are updating the finalizer list
+		//nolint:gocritic // We want to ignore not found errors here
 		if err := c.kubeClient.Patch(ctx, nodeClass, client.MergeFromWithOptions(stored, client.MergeFromWithOptimisticLock{})); client.IgnoreNotFound(err) != nil {
 			if errors.IsConflict(err) {
 				return reconcile.Result{Requeue: true}, nil

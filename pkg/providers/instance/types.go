@@ -18,7 +18,7 @@ import (
 	"context"
 	"time"
 
-	"github.com/linode/linodego"
+	"github.com/linode/linodego/v2"
 )
 
 // Instance is an internal data representation of a linode.Instance
@@ -39,7 +39,7 @@ type Instance struct {
 	InterfaceGeneration linodego.InterfaceGeneration
 }
 
-func NewInstance(_ context.Context, instance linodego.Instance) *Instance {
+func NewInstance(_ context.Context, instance *linodego.Instance) *Instance {
 	return &Instance{
 		ID:              instance.ID,
 		Created:         instance.Created,

@@ -33,7 +33,6 @@ func init() {
 	karpv1.RestrictedLabelDomains = karpv1.RestrictedLabelDomains.Insert(RestrictedLabelDomains...)
 	karpv1.WellKnownLabels = karpv1.WellKnownLabels.Union(LinodeWellKnownLabels)
 	karpv1.WellKnownLabels = karpv1.WellKnownLabels.Delete(unused...)
-
 }
 
 var (
@@ -59,6 +58,7 @@ var (
 
 	TerminationFinalizer                     = apis.Group + "/termination"
 	AnnotationInstanceTagged                 = apis.Group + "/tagged"
+	AnnotationLastAppliedUserTags            = apis.Group + "/last-applied-user-tags"
 	NodeClaimTagKey                          = coreapis.Group + "/nodeclaim"
 	NameTagKey                               = "Name"
 	LabelNodeClass                           = apis.Group + "/linodenodeclass"
